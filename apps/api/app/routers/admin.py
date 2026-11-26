@@ -116,15 +116,7 @@ async def verify_public_document(code: str, db: AsyncSession = Depends(get_db)):
     raise HTTPException(status_code=404, detail="Document code not recognized")
 
 
-@router.get("/public/tenants/{slug}")
-async def get_public_tenant_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
-    clean_slug = slug.strip().lower()
-    tenant = (
-        await db.execute(select(Tenant).where(Tenant.slug == clean_slug, Tenant.is_active == True))  # noqa: E712
-    ).scalar_one_or_none()
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Venue workspace not found or inactive")
-
+async def _build_public_storefront(db: AsyncSession, tenant: Tenant) -> dict:
     branding = (
         await db.execute(select(TenantBranding).where(TenantBranding.tenant_id == tenant.id))
     ).scalar_one_or_none()
@@ -142,18 +134,12 @@ async def get_public_tenant_by_slug(slug: str, db: AsyncSession = Depends(get_db
         )
     ).scalars().all()
 
+    settings_dict = tenant.settings or {}
+    meta = settings_dict.get("storefront_meta") or {}
+    hall_media = settings_dict.get("hall_media") or {}
+    offers = settings_dict.get("storefront_offers") or []
+
     return {
-        "default_security_deposit": float((tenant.settings or {}).get("defaultSecurityDeposit", 0)),
-        "addon_items": [
-            {
-                "id": str(a.id),
-                "name": a.name,
-                "category": a.category,
-                "total_stock": a.total_stock,
-                "unit_addon_price": float(a.unit_addon_price),
-            }
-            for a in addon_items
-        ],
         "id": str(tenant.id),
         "name": tenant.name,
         "slug": tenant.slug,
@@ -161,6 +147,7 @@ async def get_public_tenant_by_slug(slug: str, db: AsyncSession = Depends(get_db
         "custom_domain_verified": tenant.custom_domain_verified,
         "currency": tenant.currency,
         "tax_rate": float(tenant.tax_rate),
+        "default_security_deposit": float(settings_dict.get("defaultSecurityDeposit", 0)),
         "subscription_tier": tenant.subscription_tier.value,
         "subscription_status": tenant.subscription_status.value,
         "payment_accounts": tenant.payment_accounts
@@ -181,6 +168,17 @@ async def get_public_tenant_by_slug(slug: str, db: AsyncSession = Depends(get_db
             "faviconUrl": branding.favicon_url if branding else None,
             "heroTaglineAr": branding.hero_tagline_ar if branding else None,
             "heroTaglineEn": branding.hero_tagline_en if branding else None,
+            "heroTitleAr": meta.get("heroTitleAr") or tenant.name,
+            "heroTitleEn": meta.get("heroTitleEn") or tenant.name,
+            "heroSubtitleAr": meta.get("heroSubtitleAr") or (branding.hero_tagline_ar if branding else None),
+            "heroSubtitleEn": meta.get("heroSubtitleEn") or (branding.hero_tagline_en if branding else None),
+            "heroVideoUrl": meta.get("heroVideoUrl"),
+            "heroBannerUrl": meta.get("heroBannerUrl"),
+            "contactPhone": meta.get("contactPhone"),
+            "whatsappNumber": meta.get("whatsappNumber"),
+            "addressAr": meta.get("addressAr"),
+            "addressEn": meta.get("addressEn"),
+            "socialLinks": meta.get("socialLinks") or {},
         },
         "halls": [
             {
@@ -192,8 +190,22 @@ async def get_public_tenant_by_slug(slug: str, db: AsyncSession = Depends(get_db
                 "base_price": float(h.base_price),
                 "cleaning_buffer_minutes": h.cleaning_buffer_minutes,
                 "combinable_with_hall_id": str(h.combinable_with_hall_id) if h.combinable_with_hall_id else None,
+                "gallery_urls": (hall_media.get(str(h.id)) or {}).get("gallery_urls") or [],
+                "video_url": (hall_media.get(str(h.id)) or {}).get("video_url"),
+                "amenities": (hall_media.get(str(h.id)) or {}).get("amenities") or [],
             }
             for h in halls
+        ],
+        "offers": offers,
+        "addon_items": [
+            {
+                "id": str(a.id),
+                "name": a.name,
+                "category": a.category,
+                "total_stock": a.total_stock,
+                "unit_addon_price": float(a.unit_addon_price),
+            }
+            for a in addon_items
         ],
         "catering_items": [
             {
@@ -205,6 +217,28 @@ async def get_public_tenant_by_slug(slug: str, db: AsyncSession = Depends(get_db
             for c in catering_items
         ],
     }
+
+
+@router.get("/public/tenants/{slug}")
+async def get_public_tenant_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
+    clean_slug = slug.strip().lower()
+    tenant = (
+        await db.execute(select(Tenant).where(Tenant.slug == clean_slug, Tenant.is_active == True))  # noqa: E712
+    ).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Venue workspace not found or inactive")
+    return await _build_public_storefront(db, tenant)
+
+
+@router.get("/public/tenants/{slug}/storefront")
+async def get_public_tenant_storefront(slug: str, db: AsyncSession = Depends(get_db)):
+    clean_slug = slug.strip().lower()
+    tenant = (
+        await db.execute(select(Tenant).where(Tenant.slug == clean_slug, Tenant.is_active == True))  # noqa: E712
+    ).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Venue workspace not found or inactive")
+    return await _build_public_storefront(db, tenant)
 
 
 @router.get("/admin/tenants")

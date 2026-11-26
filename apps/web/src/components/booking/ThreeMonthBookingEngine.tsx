@@ -101,11 +101,21 @@ interface ReceiptResponse {
   receipt_url: string;
 }
 
+export interface StorefrontOffer {
+  id: string;
+  title_ar: string;
+  title_en: string;
+  discount_percent?: number | null;
+  package_price?: number | null;
+}
+
 export interface ThreeMonthBookingEngineProps {
   mode: 'GLOBAL_ROOT' | 'TENANT_STOREFRONT';
   locale: Locale;
   /** Required (and locked) when mode === 'TENANT_STOREFRONT'. */
   tenantSlug?: string;
+  selectedHallId?: string;
+  appliedOffer?: StorefrontOffer | null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -222,7 +232,13 @@ const STATUS_CLASS: Record<DayStatus, string> = {
 /* Component                                                           */
 /* ------------------------------------------------------------------ */
 
-export default function ThreeMonthBookingEngine({ mode, locale, tenantSlug }: ThreeMonthBookingEngineProps) {
+export default function ThreeMonthBookingEngine({
+  mode,
+  locale,
+  tenantSlug,
+  selectedHallId,
+  appliedOffer,
+}: ThreeMonthBookingEngineProps) {
   const isAr = locale === 'ar';
   const t = useCallback((k: TxtKey) => TXT[k][locale], [locale]);
   const locked = mode === 'TENANT_STOREFRONT';
@@ -239,8 +255,12 @@ export default function ThreeMonthBookingEngine({ mode, locale, tenantSlug }: Th
   const [error, setError] = useState<string | null>(null);
 
   const [venueSlug, setVenueSlug] = useState<string>(locked ? (tenantSlug ?? '') : 'ALL');
-  const [hallFilter, setHallFilter] = useState<string>('ALL');
+  const [hallFilter, setHallFilter] = useState<string>(selectedHallId || 'ALL');
   const [merge, setMerge] = useState(false);
+
+  useEffect(() => {
+    if (selectedHallId) setHallFilter(selectedHallId);
+  }, [selectedHallId]);
 
   const [selected, setSelected] = useState<{ date: string; slug: string; hallId: string } | null>(null);
   const [step, setStep] = useState(1);
@@ -377,10 +397,15 @@ export default function ThreeMonthBookingEngine({ mode, locale, tenantSlug }: Th
     const catering = cat ? cat.price_per_guest * guests : 0;
     const addons = addonItems.reduce((s, a) => s + a.unit_addon_price * (qty[a.id] ?? 0), 0);
     const mergedAddon = merge && partner ? Math.round(partner.base_price * 0.85 * 100) / 100 : 0;
-    const subtotal = hallPrice + catering + addons + mergedAddon;
+    const rawSubtotal = hallPrice + catering + addons + mergedAddon;
+    const discount =
+      appliedOffer?.discount_percent && appliedOffer.discount_percent > 0
+        ? Math.round(rawSubtotal * (appliedOffer.discount_percent / 100) * 100) / 100
+        : 0;
+    const subtotal = Math.max(0, rawSubtotal - discount);
     const tax = subtotal * (taxRate / 100);
-    return { hallPrice, catering, addons, mergedAddon, subtotal, tax, total: subtotal + tax };
-  }, [selectedDay, cateringItems, addonItems, cateringId, guests, qty, merge, partner, taxRate]);
+    return { hallPrice, catering, addons, mergedAddon, discount, subtotal, tax, total: subtotal + tax };
+  }, [selectedDay, cateringItems, addonItems, cateringId, guests, qty, merge, partner, taxRate, appliedOffer]);
 
   /* ---------------- actions ---------------- */
 
@@ -938,6 +963,11 @@ export default function ThreeMonthBookingEngine({ mode, locale, tenantSlug }: Th
                       {pricing.mergedAddon > 0 && row(t('mergedAddon'), money(pricing.mergedAddon, currency))}
                       {row(t('cateringTotal'), money(pricing.catering, currency))}
                       {row(t('addonsTotal'), money(pricing.addons, currency))}
+                      {pricing.discount > 0 &&
+                        row(
+                          `${isAr ? appliedOffer?.title_ar : appliedOffer?.title_en} (-${appliedOffer?.discount_percent}%)`,
+                          `-${money(pricing.discount, currency)}`
+                        )}
                       {row(t('subtotal'), money(pricing.subtotal, currency))}
                       {row(`${t('tax')} (${taxRate}%)`, money(pricing.tax, currency))}
                       {row(t('total'), money(pricing.total, currency), true)}

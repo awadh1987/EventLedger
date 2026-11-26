@@ -48,6 +48,108 @@ class PatchLookupBody(BaseModel):
     lifecycle: Optional[RecordLifecycle] = None
 
 
+class StorefrontOfferBody(BaseModel):
+    id: Optional[str] = None
+    title_ar: str
+    title_en: str
+    description_ar: Optional[str] = None
+    description_en: Optional[str] = None
+    discount_percent: Optional[float] = None
+    package_price: Optional[float] = None
+    valid_until: Optional[str] = None
+    badge_text: Optional[str] = None
+    banner_image_url: Optional[str] = None
+
+
+class HallMediaBody(BaseModel):
+    gallery_urls: list[str] = Field(default_factory=list)
+    video_url: Optional[str] = None
+    amenities: list[str] = Field(default_factory=list)
+
+
+class UpdateStorefrontBody(BaseModel):
+    heroTitleAr: Optional[str] = None
+    heroTitleEn: Optional[str] = None
+    heroSubtitleAr: Optional[str] = None
+    heroSubtitleEn: Optional[str] = None
+    heroVideoUrl: Optional[str] = None
+    heroBannerUrl: Optional[str] = None
+    contactPhone: Optional[str] = None
+    whatsappNumber: Optional[str] = None
+    addressAr: Optional[str] = None
+    addressEn: Optional[str] = None
+    socialLinks: Optional[dict[str, str]] = None
+    hall_media: Optional[dict[str, HallMediaBody]] = None
+    offers: Optional[list[StorefrontOfferBody]] = None
+
+
+@router.get("/erp/settings/storefront")
+async def get_erp_storefront_settings(
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.SALES_MANAGER})),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    tenant = (await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    s = tenant.settings or {}
+    return {
+        "meta": s.get("storefront_meta") or {},
+        "hall_media": s.get("hall_media") or {},
+        "offers": s.get("storefront_offers") or [],
+    }
+
+
+@router.put("/erp/settings/storefront")
+async def update_erp_storefront_settings(
+    body: UpdateStorefrontBody,
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.SALES_MANAGER})),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    tenant = (await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    s = dict(tenant.settings or {})
+    meta = dict(s.get("storefront_meta") or {})
+    for k in (
+        "heroTitleAr",
+        "heroTitleEn",
+        "heroSubtitleAr",
+        "heroSubtitleEn",
+        "heroVideoUrl",
+        "heroBannerUrl",
+        "contactPhone",
+        "whatsappNumber",
+        "addressAr",
+        "addressEn",
+        "socialLinks",
+    ):
+        val = getattr(body, k)
+        if val is not None:
+            meta[k] = val
+    s["storefront_meta"] = meta
+
+    if body.hall_media is not None:
+        s["hall_media"] = {hid: hm.model_dump() for hid, hm in body.hall_media.items()}
+
+    if body.offers is not None:
+        normalized_offers = []
+        for o in body.offers:
+            od = o.model_dump()
+            if not od.get("id"):
+                od["id"] = str(uuid.uuid4())
+            normalized_offers.append(od)
+        s["storefront_offers"] = normalized_offers
+
+    tenant.settings = s
+    await db.commit()
+    return {"status": "UPDATED", "meta": meta, "hall_media": s.get("hall_media") or {}, "offers": s.get("storefront_offers") or []}
+
+
 @router.get("/tenant/branding")
 async def get_tenant_branding(
     auth: AuthContext = Depends(get_current_auth),
