@@ -1,6 +1,7 @@
 from fastapi import Request
 from sqlalchemy import select
 from starlette.middleware.base import BaseHTTPMiddleware
+
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.tenant import Tenant
@@ -17,24 +18,29 @@ class TenantResolverMiddleware(BaseHTTPMiddleware):
         request.state.tenant = None
         request.state.tenant_mode = "PLATFORM_ROOT"
 
-        if host == f"admin.{ROOT_DOMAIN}":
+        if host == f"admin.{ROOT_DOMAIN}" or host.startswith("admin."):
             request.state.tenant_mode = "PLATFORM_SUPER_ADMIN"
-            return await call_next(request)
+            if not slug_header and not custom_domain_header:
+                return await call_next(request)
 
         async with AsyncSessionLocal() as db:
             tenant = None
             if slug_header:
-                res = await db.execute(select(Tenant).where(Tenant.slug == slug_header, Tenant.is_active == True))
+                res = await db.execute(select(Tenant).where(Tenant.slug == slug_header, Tenant.is_active == True))  # noqa: E712
                 tenant = res.scalar_one_or_none()
             elif custom_domain_header:
-                res = await db.execute(select(Tenant).where(Tenant.custom_domain == custom_domain_header, Tenant.is_active == True))
+                res = await db.execute(
+                    select(Tenant).where(Tenant.custom_domain == custom_domain_header, Tenant.is_active == True)  # noqa: E712
+                )
                 tenant = res.scalar_one_or_none()
-            elif host and host not in (ROOT_DOMAIN, f"www.{ROOT_DOMAIN}", "localhost", "127.0.0.1"):
+            elif host and host not in (ROOT_DOMAIN, f"www.{ROOT_DOMAIN}", "localhost", "127.0.0.1", "testserver"):
                 if host.endswith(f".{ROOT_DOMAIN}"):
                     slug = host.replace(f".{ROOT_DOMAIN}", "")
-                    res = await db.execute(select(Tenant).where(Tenant.slug == slug, Tenant.is_active == True))
+                    res = await db.execute(select(Tenant).where(Tenant.slug == slug, Tenant.is_active == True))  # noqa: E712
                 else:
-                    res = await db.execute(select(Tenant).where(Tenant.custom_domain == host, Tenant.is_active == True))
+                    res = await db.execute(
+                        select(Tenant).where(Tenant.custom_domain == host, Tenant.is_active == True)  # noqa: E712
+                    )
                 tenant = res.scalar_one_or_none()
 
             if tenant:

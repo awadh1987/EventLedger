@@ -1,0 +1,27 @@
+{
+  "brand": {
+    "name": "EventLedger",
+    "tagline": "Multi-Tenant Venue, Wedding Hall & Conference SaaS ERP"
+  },
+  "nav": {
+    "home": "Home",
+    "portal": "Client Portal",
+    "erp": "ERP Dashboard",
+    "ledger": "General Ledger",
+    "beo": "Live BEO",
+    "branding": "Branding",
+    "gate": "Security Gate",
+    "login": "Sign In",
+    "logout": "Sign Out"
+  },
+  "common": {
+    "save": "Save",
+    "submit": "Submit",
+    "cancel": "Cancel",
+    "approve": "Approve",
+    "reject": "Reject",
+    "loading": "Loading...",
+    "copy": "Copy",
+    "copied": "Copied"
+  }
+}

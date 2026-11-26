@@ -3,13 +3,13 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
-from sqlalchemy import String, Integer, Boolean, DateTime, ForeignKey, Numeric, Text, Enum, JSON, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-class Base(DeclarativeBase):
-    pass
+from app.models.base import Base, RecordLifecycle, TenantOwnedMixin, UUIDPkMixin, utcnow
+
+__all__ = ["Base", "RecordLifecycle", "SubscriptionTier", "Tenant", "TenantBranding", "SystemLookup"]
 
 
 class SubscriptionTier(str, enum.Enum):
@@ -18,17 +18,9 @@ class SubscriptionTier(str, enum.Enum):
     ENTERPRISE = "ENTERPRISE"
 
 
-class RecordLifecycle(str, enum.Enum):
-    DRAFT = "DRAFT"
-    ACTIVE = "ACTIVE"
-    ARCHIVED = "ARCHIVED"
-    DELETED = "DELETED"
-
-
-class Tenant(Base):
+class Tenant(UUIDPkMixin, Base):
     __tablename__ = "tenants"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255))
     slug: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     custom_domain: Mapped[Optional[str]] = mapped_column(String(255), unique=True, nullable=True)
@@ -38,15 +30,14 @@ class Tenant(Base):
     settings: Mapped[dict] = mapped_column(JSON, default=dict)
     whatsapp_config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     branding: Mapped[Optional["TenantBranding"]] = relationship(back_populates="tenant", uselist=False)
 
 
-class TenantBranding(Base):
+class TenantBranding(UUIDPkMixin, Base):
     __tablename__ = "tenant_brandings"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), unique=True)
     logo_light_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     logo_dark_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -62,13 +53,11 @@ class TenantBranding(Base):
     tenant: Mapped["Tenant"] = relationship(back_populates="branding")
 
 
-class SystemLookup(Base):
+class SystemLookup(UUIDPkMixin, TenantOwnedMixin, Base):
     __tablename__ = "system_lookups"
     __table_args__ = (UniqueConstraint("tenant_id", "category", "code", name="uq_tenant_category_code"),)
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
-    category: Mapped[str] = mapped_column(String(60))
+    category: Mapped[str] = mapped_column(String(60), index=True)
     code: Mapped[str] = mapped_column(String(60))
     label_ar: Mapped[str] = mapped_column(String(255))
     label_en: Mapped[str] = mapped_column(String(255))

@@ -3,10 +3,11 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
-from sqlalchemy import String, Integer, Boolean, DateTime, ForeignKey, Numeric, Text, Enum, JSON
-from sqlalchemy.dialects.postgresql import UUID
+
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
-from app.models.tenant import Base
+
+from app.models.base import Base, TenantOwnedMixin, UUIDPkMixin, utcnow
 
 
 class EventStatus(str, enum.Enum):
@@ -40,11 +41,9 @@ class ApprovalStatus(str, enum.Enum):
     REJECTED = "REJECTED"
 
 
-class Event(Base):
+class Event(UUIDPkMixin, TenantOwnedMixin, Base):
     __tablename__ = "events"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
     hall_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("halls.id"))
     primary_client_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     assigned_sales_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"), nullable=True)
@@ -55,13 +54,12 @@ class Event(Base):
     status: Mapped[EventStatus] = mapped_column(Enum(EventStatus), default=EventStatus.INQUIRY)
     guest_count: Mapped[int] = mapped_column(Integer)
     is_locked: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
-class EventDraft(Base):
+class EventDraft(UUIDPkMixin, TenantOwnedMixin, Base):
     __tablename__ = "event_drafts"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"), index=True)
     created_by_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     version_number: Mapped[int] = mapped_column(Integer)
@@ -69,13 +67,12 @@ class EventDraft(Base):
     payload: Mapped[dict] = mapped_column(JSON)
     financial_delta: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"))
     status: Mapped[DraftStatus] = mapped_column(Enum(DraftStatus), default=DraftStatus.DRAFT)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
-class ApprovalRequest(Base):
+class ApprovalRequest(UUIDPkMixin, TenantOwnedMixin, Base):
     __tablename__ = "approval_requests"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"), index=True)
     draft_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("event_drafts.id", ondelete="CASCADE"))
     requested_by_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
@@ -83,14 +80,13 @@ class ApprovalRequest(Base):
     approved_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"), nullable=True)
     status: Mapped[ApprovalStatus] = mapped_column(Enum(ApprovalStatus), default=ApprovalStatus.PENDING)
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
-class EventMessage(Base):
+class EventMessage(UUIDPkMixin, TenantOwnedMixin, Base):
     __tablename__ = "event_messages"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"), index=True)
     sender_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     channel: Mapped[str] = mapped_column(String(30), default="IN_APP")
@@ -99,13 +95,12 @@ class EventMessage(Base):
     attachments: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     external_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     is_internal: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
-class GatePass(Base):
+class GatePass(UUIDPkMixin, TenantOwnedMixin, Base):
     __tablename__ = "gate_passes"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"), index=True)
     pass_type: Mapped[str] = mapped_column(String(40))
     holder_name: Mapped[str] = mapped_column(String(255))
@@ -117,15 +112,13 @@ class GatePass(Base):
     checked_in_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
-class AuditLog(Base):
+class AuditLog(UUIDPkMixin, TenantOwnedMixin, Base):
     __tablename__ = "audit_logs"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
     event_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("events.id", ondelete="SET NULL"), nullable=True)
     actor_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     action: Mapped[str] = mapped_column(String(120))
     old_value: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     new_value: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     ip_address: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

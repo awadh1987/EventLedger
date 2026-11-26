@@ -1,10 +1,14 @@
 import asyncio
 from logging.config import fileConfig
+
 from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
+
 from app.core.config import settings
-from app.models.tenant import Base
+from app.core.database import normalize_db_url
+from app.models.base import Base
+import app.models.tenant  # noqa: F401
 import app.models.users  # noqa: F401
 import app.models.venue  # noqa: F401
 import app.models.events  # noqa: F401
@@ -18,10 +22,7 @@ target_metadata = Base.metadata
 
 
 def get_url() -> str:
-    url = settings.DATABASE_URL
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return url.split("?")[0]
+    return normalize_db_url(settings.DATABASE_URL)
 
 
 def run_migrations_offline() -> None:

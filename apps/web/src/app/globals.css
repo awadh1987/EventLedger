@@ -6,4 +6,12 @@
   --brand-primary: #D4AF37;
   --brand-accent: #0F172A;
   --brand-glow: rgba(212, 175, 55, 0.18);
+  --font-sans-en: 'Plus Jakarta Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-sans-ar: 'IBM Plex Sans Arabic', 'Tahoma', 'Arial', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+}
+
+body {
+  font-family: var(--font-sans-en), var(--font-sans-ar);
+  -webkit-tap-highlight-color: transparent;
 }

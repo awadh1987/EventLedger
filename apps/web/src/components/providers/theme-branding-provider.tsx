@@ -2,18 +2,15 @@
 
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { ThemeProvider as NextThemesProvider } from 'next-themes';
+import { apiFetch } from '@/lib/api';
+import type { PublicTenant } from '@/lib/types';
 
 export interface TenantBrandingConfig {
   id: string;
-  venueNameAr: string;
-  venueNameEn: string;
-  taglineAr: string;
-  taglineEn: string;
+  venueName: string;
   slug: string;
-  customDomain: string;
   currency: string;
   taxRate: number;
-  defaultSecurityDeposit: number;
   logoLightUrl?: string | null;
   logoDarkUrl?: string | null;
   faviconUrl?: string | null;
@@ -22,12 +19,6 @@ export interface TenantBrandingConfig {
   defaultTheme: 'LIGHT' | 'DARK' | 'SYSTEM';
   enableSpotlight: boolean;
   spotlightColor: string;
-  contactPhone: string;
-  contactEmail: string;
-  addressAr: string;
-  addressEn: string;
-  invoiceFooterAr: string;
-  invoiceFooterEn: string;
 }
 
 interface TenantBrandingContextValue extends TenantBrandingConfig {
@@ -36,29 +27,16 @@ interface TenantBrandingContextValue extends TenantBrandingConfig {
 }
 
 export const DEFAULT_BRANDING: TenantBrandingConfig = {
-  id: 'almassa',
-  venueNameAr: 'قصر الماسة للمؤتمرات والأفراح',
-  venueNameEn: 'Al-Massa Grand Palace',
-  taglineAr: 'أرقى قاعات الأفراح والمؤتمرات والضيافة الملكية في قلب العاصمة',
-  taglineEn: 'Premier Wedding Halls, Executive Conferences & Royal Banquet Hospitality',
+  id: '',
+  venueName: 'EventLedger',
   slug: 'almassa',
-  customDomain: 'events.almassa.ye',
   currency: 'YER',
   taxRate: 5,
-  defaultSecurityDeposit: 150000,
   primaryColor: '#D4AF37',
   accentColor: '#0F172A',
   defaultTheme: 'DARK',
   enableSpotlight: true,
   spotlightColor: 'rgba(212, 175, 55, 0.18)',
-  contactPhone: '+967 770 000 001',
-  contactEmail: 'concierge@almassa.ye',
-  addressAr: 'شارع حدة الرئيسي — صنعاء، الجمهورية اليمنية',
-  addressEn: 'Hadda Main Boulevard — Sanaa, Republic of Yemen',
-  invoiceFooterAr:
-    'تُعد هذه الفاتورة مستنداً مالياً معتمداً من قصر الماسة للمؤتمرات والأفراح. يُرد مبلغ التأمين خلال 48 ساعة بعد معاينة القاعة.',
-  invoiceFooterEn:
-    'Official financial invoice issued by Al-Massa Grand Palace. Security deposits are refunded within 48 hours after post-event inspection.',
 };
 
 const BrandingContext = createContext<TenantBrandingContextValue>({
@@ -71,37 +49,34 @@ export function useTenantBranding() {
   return useContext(BrandingContext);
 }
 
-export function ThemeBrandingProvider({
-  children,
-  branding,
-}: {
-  children: React.ReactNode;
-  branding?: Partial<TenantBrandingConfig>;
-}) {
-  const [config, setConfig] = useState<TenantBrandingConfig>(() => ({
-    ...DEFAULT_BRANDING,
-    ...branding,
-  }));
+export function ThemeBrandingProvider({ children }: { children: React.ReactNode }) {
+  const [config, setConfig] = useState<TenantBrandingConfig>(DEFAULT_BRANDING);
 
   const refreshBranding = useCallback(async () => {
     try {
-      const res = await fetch('/api/v1/tenant/branding', { cache: 'no-store' });
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data?.branding) {
-        setConfig((prev) => ({
-          ...prev,
-          ...data.branding,
-          defaultTheme:
-            data.branding.defaultTheme === 'LIGHT' ||
-            data.branding.defaultTheme === 'DARK' ||
-            data.branding.defaultTheme === 'SYSTEM'
-              ? data.branding.defaultTheme
-              : prev.defaultTheme,
-        }));
-      }
+      const data = await apiFetch<PublicTenant>('/api/v1/public/tenant', { skipAuth: true });
+      const b = data.branding;
+      const theme =
+        b.default_theme === 'LIGHT' || b.default_theme === 'DARK' || b.default_theme === 'SYSTEM'
+          ? b.default_theme
+          : 'SYSTEM';
+      setConfig({
+        id: data.id,
+        venueName: data.name,
+        slug: data.slug,
+        currency: data.currency,
+        taxRate: data.tax_rate,
+        primaryColor: b.primary_color || '#D4AF37',
+        accentColor: b.accent_color || '#0F172A',
+        spotlightColor: b.spotlight_color || 'rgba(212, 175, 55, 0.18)',
+        defaultTheme: theme,
+        enableSpotlight: b.enable_spotlight,
+        logoLightUrl: b.logo_light_url,
+        logoDarkUrl: b.logo_dark_url,
+        faviconUrl: b.favicon_url,
+      });
     } catch {
-      // keep current branding gracefully
+      // Keep default branding if offline or on platform root
     }
   }, []);
 
@@ -130,11 +105,7 @@ export function ThemeBrandingProvider({
   }, [config]);
 
   const value = useMemo<TenantBrandingContextValue>(
-    () => ({
-      ...config,
-      refreshBranding,
-      applyBranding,
-    }),
+    () => ({ ...config, refreshBranding, applyBranding }),
     [config, refreshBranding, applyBranding]
   );
 

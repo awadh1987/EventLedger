@@ -2,12 +2,15 @@
 const isNativeBuild = process.env.BUILD_TARGET === 'NATIVE';
 
 const nextConfig = {
-  experimental: {
-    externalDir: true,
-    serverComponentsExternalPackages: ['pg', 'firebase-admin', 'ws', '@google/genai'],
+  webpack: (config) => {
+    config.resolve.alias = {
+      ...(config.resolve.alias || {}),
+      canvas: false,
+    };
+    return config;
   },
   ...(isNativeBuild
-    ? { output: 'export', images: { unoptimized: true } }
+    ? { output: 'export', trailingSlash: true, images: { unoptimized: true } }
     : { images: { unoptimized: true } }),
 };
 

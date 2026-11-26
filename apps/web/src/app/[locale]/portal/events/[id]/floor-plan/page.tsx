@@ -1,125 +1,124 @@
 'use client';
 
-import React, { useState } from 'react';
-import Link from 'next/link';
-import { useParams } from 'next/navigation';
-import { ArrowLeft, ArrowRight, CheckCircle2 } from 'lucide-react';
-import { FloorPlanCanvas, type FloorItem } from '@/components/portal/FloorPlanCanvas';
+import React, { Suspense, useEffect, useState } from 'react';
+import dynamic from 'next/dynamic';
+import { useParams, useSearchParams } from 'next/navigation';
+import { apiFetch } from '@/lib/api';
+import { AppHeader } from '@/components/layout/AppHeader';
 import { MobileBottomNav } from '@/components/layout/MobileBottomNav';
-import { useAuth } from '@/components/providers/auth-provider';
-import { useTenantBranding } from '@/components/providers/theme-branding-provider';
-import { SpotlightHeading } from '@/components/ui/spotlight-elements';
+import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
+import type { FloorPlanElement } from '@/lib/types';
 
-export default function EventFloorPlanPage() {
-  const params = useParams<{ locale?: string; id?: string }>();
-  const locale: 'ar' | 'en' = params?.locale === 'en' ? 'en' : 'ar';
-  const eventId = params?.id || 'EVT-2026-101';
+const FloorPlanCanvas = dynamic(
+  () => import('@/components/portal/FloorPlanCanvas').then((m) => m.FloorPlanCanvas),
+  { ssr: false }
+);
+
+function FloorPlanInner() {
+  const params = useParams<{ locale: string; id: string }>();
+  const searchParams = useSearchParams();
+  const locale = params?.locale === 'en' ? 'en' : 'ar';
   const isRtl = locale === 'ar';
-  const branding = useTenantBranding();
-  const { authFetch } = useAuth();
+  const eventId = params?.id === '_' ? searchParams?.get('id') || '' : params?.id || '';
 
+  const [elements, setElements] = useState<FloorPlanElement[]>([]);
+  const [lastDraftId, setLastDraftId] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [lastPayload, setLastPayload] = useState<{ items: FloorItem[]; totalSeatedGuests: number } | null>(null);
-  const [lastDelta, setLastDelta] = useState<number>(0);
 
-  const BackIcon = isRtl ? ArrowRight : ArrowLeft;
+  useEffect(() => {
+    if (!eventId) return;
+    apiFetch<{ id: string; draft_type: string; payload: { elements?: FloorPlanElement[] } }[]>(
+      `/api/v1/events/${eventId}/drafts`
+    )
+      .then((drafts) => {
+        const fp = drafts.find((d) => d.draft_type === 'FLOOR_PLAN');
+        if (fp) {
+          setLastDraftId(fp.id);
+          setElements(fp.payload?.elements || []);
+        }
+      })
+      .catch(() => undefined);
+  }, [eventId]);
 
-  const handleSaveDraft = async (payload: { items: FloorItem[]; totalSeatedGuests: number }, financialDelta: number) => {
-    setLastPayload(payload);
-    setLastDelta(financialDelta);
-    setNotice(
-      isRtl
-        ? `تم حفظ مسودة مخطط القاعة (${payload.totalSeatedGuests} ضيف · فارق التكلفة +${financialDelta.toLocaleString()} ${branding.currency}).`
-        : `Floor plan draft saved (${payload.totalSeatedGuests} seated guests · delta +${financialDelta.toLocaleString()} ${branding.currency}).`
-    );
+  const saveDraft = async (): Promise<string | null> => {
+    if (!eventId) return null;
+    setSaving(true);
+    setNotice(null);
+    try {
+      const totalSeatedGuests = elements.reduce((acc, el) => acc + (el.seats || 0), 0);
+      const res = await apiFetch<{ draft_id: string; version_number: number }>(`/api/v1/events/${eventId}/drafts`, {
+        method: 'POST',
+        body: {
+          draft_type: 'FLOOR_PLAN',
+          payload: { elements, totalSeatedGuests },
+          financial_delta: 0,
+        },
+      });
+      setLastDraftId(res.draft_id);
+      setNotice(isRtl ? `تم حفظ المسودة رقم ${res.version_number}` : `Saved draft v${res.version_number}`);
+      return res.draft_id;
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : 'Save failed');
+      return null;
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const handleSubmitApproval = async () => {
+  const submitApproval = async () => {
+    const id = lastDraftId || (await saveDraft());
+    if (!id) return;
+    setSaving(true);
     try {
-      const seats = lastPayload?.totalSeatedGuests || 72;
-      const res = await authFetch('/api/v1/portal', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'create_draft',
-          eventId,
-          eventCode: eventId.startsWith('EVT') ? eventId : 'EVT-2026-101',
-          draftType: 'FLOOR_PLAN',
-          titleEn: `Interactive Floor Plan Layout (${seats} Seated Guests)`,
-          titleAr: `مخطط توزيع طاولات القاعة (${seats} ضيف)`,
-          financialDelta: lastDelta,
-          notes: `Submitted from interactive FloorPlanCanvas for event ${eventId}`,
-        }),
-      });
-      if (res.ok) {
-        setNotice(
-          isRtl
-            ? 'تم إرسال مخطط القاعة لطابور الاعتماد المزدوج ومزامنته مع أمر التشغيل (BEO).'
-            : 'Floor plan submitted to the Dual-Approval queue and synced with Operations BEO.'
-        );
-      } else {
-        setNotice(
-          isRtl
-            ? 'تم تسجيل طلب اعتماد المخطط محلياً وجاهز للمزامنة.'
-            : 'Floor plan approval draft queued and ready for sync.'
-        );
-      }
-    } catch {
+      const res = await apiFetch<{ approval_id: string; required_approver_role: string }>(
+        `/api/v1/drafts/${id}/submit`,
+        { method: 'POST' }
+      );
       setNotice(
         isRtl
-          ? 'تم تسجيل طلب اعتماد المخطط محلياً وجاهز للمزامنة.'
-          : 'Floor plan approval draft queued and ready for sync.'
+          ? `تم إرسال المخطط للاعتماد (${res.required_approver_role})`
+          : `Submitted for approval (${res.required_approver_role})`
       );
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : 'Submit failed');
+    } finally {
+      setSaving(false);
     }
   };
 
   return (
-    <div dir={isRtl ? 'rtl' : 'ltr'} className="min-h-screen bg-slate-50 pb-24 dark:bg-slate-950">
-      <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/95 backdrop-blur dark:border-slate-800 dark:bg-slate-950/95">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-6 py-4">
-          <div className="flex items-center gap-3">
-            <Link
-              href={`/${locale}/portal/dashboard`}
-              className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-slate-200 px-3 text-xs font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-800 dark:text-slate-200 dark:hover:bg-slate-900"
-            >
-              <BackIcon className="h-3.5 w-3.5" />
-              <span>{isRtl ? 'العودة لبوابة العميل' : 'Back to Client Portal'}</span>
-            </Link>
-            <SpotlightHeading as="h1" className="text-lg">
-              {isRtl ? `مصمم مخطط القاعة (${eventId})` : `Hall Floor Plan Studio (${eventId})`}
-            </SpotlightHeading>
-          </div>
-          <Link
-            href={`/${locale === 'ar' ? 'en' : 'ar'}/portal/events/${eventId}/floor-plan`}
-            className="text-xs font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white"
-          >
-            {isRtl ? 'English' : 'العربية'}
-          </Link>
-        </div>
-      </header>
+    <div className="min-h-screen bg-slate-50 pb-24 dark:bg-slate-950 md:pb-12">
+      <AppHeader locale={locale} />
+      <main className="mx-auto max-w-6xl space-y-5 px-4 py-6">
+        <SpotlightHeading as="h1" className="text-2xl">
+          {isRtl ? 'مصمم مخطط القاعة التفاعلي (Konva)' : 'Interactive Floor Plan Designer'}
+        </SpotlightHeading>
 
-      <main className="mx-auto max-w-6xl space-y-6 p-6">
         {notice && (
-          <div className="flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-4 py-3 text-xs font-medium text-emerald-800 dark:border-emerald-800/70 dark:bg-emerald-950/40 dark:text-emerald-200">
-            <CheckCircle2 className="h-4 w-4 shrink-0" />
-            <span>{notice}</span>
-          </div>
+          <SpotlightCard className="border-emerald-500/40 bg-emerald-500/10 py-3 text-xs text-emerald-400">
+            {notice}
+          </SpotlightCard>
         )}
 
         <FloorPlanCanvas
-          eventId={eventId}
-          hallCapacity={500}
-          includedTablesQuota={5}
-          extraTableUnitPrice={15000}
-          currency={branding.currency}
           locale={locale}
-          isLocked={false}
-          onSaveDraft={handleSaveDraft}
-          onSubmitApproval={handleSubmitApproval}
+          elements={elements}
+          onChange={setElements}
+          onSaveDraft={saveDraft}
+          onSubmitApproval={submitApproval}
+          saving={saving}
         />
       </main>
-
       <MobileBottomNav persona="CLIENT" locale={locale} />
     </div>
+  );
+}
+
+export default function EventFloorPlanPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-slate-950 p-6 text-sm text-slate-400">Loading...</div>}>
+      <FloorPlanInner />
+    </Suspense>
   );
 }

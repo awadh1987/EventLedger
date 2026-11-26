@@ -1,7 +1,24 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+
+from app.core.config import settings
+from app.core.database import AsyncSessionLocal
 from app.core.tenant_middleware import TenantResolverMiddleware
-from app.routers import approvals, auth, bookings, finance, offline_sync, phase6_ops, portal, public_onboarding
+from app.routers import (
+    approvals,
+    auth,
+    bookings,
+    finance,
+    offline_sync,
+    phase6_ops,
+    portal,
+    public_onboarding,
+    tenant_settings,
+)
 
 app = FastAPI(
     title="EventLedger (إيفنت ليدجر) API",
@@ -18,6 +35,9 @@ app.add_middleware(
 )
 app.add_middleware(TenantResolverMiddleware)
 
+os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
+
 app.include_router(public_onboarding.router)
 app.include_router(auth.auth_router)
 app.include_router(portal.portal_router)
@@ -25,9 +45,16 @@ app.include_router(bookings.router)
 app.include_router(approvals.router)
 app.include_router(finance.router)
 app.include_router(phase6_ops.router)
+app.include_router(tenant_settings.router)
 app.include_router(offline_sync.router)
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "EventLedger Python FastAPI"}
+    db_status = "ok"
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(text("SELECT 1"))
+    except Exception:
+        db_status = "unavailable"
+    return {"status": "ok", "service": "EventLedger Python FastAPI", "database": db_status}

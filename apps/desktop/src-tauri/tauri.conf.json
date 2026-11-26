@@ -5,11 +5,21 @@
   "identifier": "cloud.eventledger.desktop",
   "build": {
     "beforeDevCommand": "pnpm --filter web dev",
-    "beforeBuildCommand": "BUILD_TARGET=NATIVE pnpm --filter web build",
+    "beforeBuildCommand": "pnpm --filter web build:native",
     "frontendDist": "../../web/out"
   },
   "app": {
-    "windows": [{ "title": "EventLedger (إيفنت ليدجر)", "width": 1280, "height": 840, "resizable": true }]
+    "windows": [
+      {
+        "title": "EventLedger (إيفنت ليدجر)",
+        "width": 1280,
+        "height": 840,
+        "resizable": true
+      }
+    ]
   },
-  "bundle": { "active": true, "targets": ["nsis"] }
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"]
+  }
 }

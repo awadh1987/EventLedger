@@ -1,12 +1,22 @@
+import re
 import uuid
+from typing import Optional
+
 from fastapi import HTTPException
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.models.events import Event, EventMessage, EventStatus
 from app.models.users import User
 
+MENTION_PATTERN = re.compile(r"@(Kitchen|Finance|Ops|Security|Sales)\b", re.IGNORECASE)
+
 
 class CommsService:
+    @staticmethod
+    def extract_mentions(content: str) -> list[str]:
+        return list({m.capitalize() for m in MENTION_PATTERN.findall(content or "")})
+
     @staticmethod
     async def post_message(
         db: AsyncSession,
@@ -15,19 +25,25 @@ class CommsService:
         sender_id: uuid.UUID,
         content: str,
         channel: str = "IN_APP",
-        department: str | None = "ALL",
+        department: Optional[str] = "ALL",
         is_internal: bool = False,
-        external_id: str | None = None,
+        external_id: Optional[str] = None,
     ) -> EventMessage:
-        event = (await db.execute(select(Event).where(Event.id == event_id, Event.tenant_id == tenant_id))).scalar_one_or_none()
+        event = (
+            await db.execute(select(Event).where(Event.id == event_id, Event.tenant_id == tenant_id))
+        ).scalar_one_or_none()
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
 
+        mentions = CommsService.extract_mentions(content)
+        resolved_dept = mentions[0].upper() if mentions and (not department or department == "ALL") else department
+
         msg = EventMessage(
+            tenant_id=tenant_id,
             event_id=event_id,
             sender_id=sender_id,
             channel=channel,
-            department=department,
+            department=resolved_dept,
             content=content,
             is_internal=is_internal,
             external_id=external_id,
@@ -50,7 +66,9 @@ class CommsService:
         variants = [raw_phone, f"+{raw_phone}"] if not raw_phone.startswith("+") else [raw_phone, raw_phone[1:]]
         text_body = (wa_msg.get("text") or {}).get("body") or "[WhatsApp Media]"
 
-        user = (await db.execute(select(User).where(User.phone.in_(variants), User.is_active == True))).scalar_one_or_none()
+        user = (
+            await db.execute(select(User).where(User.phone.in_(variants), User.is_active == True))  # noqa: E712
+        ).scalar_one_or_none()
         if not user or not user.tenant_id:
             return {"status": "unknown_sender"}
 
