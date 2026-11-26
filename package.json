@@ -1,10 +1,15 @@
 {
   "name": "eventledger-saas",
   "private": true,
+  "workspaces": [
+    "apps/web"
+  ],
   "scripts": {
-    "dev:web": "pnpm --filter web dev",
-    "build:web": "pnpm --filter web build",
-    "build:exe": "pnpm --filter desktop tauri build",
-    "build:apk": "BUILD_TARGET=NATIVE pnpm --filter web build && pnpm --filter mobile cap sync android"
+    "dev": "npm run dev --workspace=apps/web",
+    "build": "npm run build --workspace=apps/web",
+    "start": "npm run start --workspace=apps/web",
+    "lint": "npm run lint --workspace=apps/web",
+    "dev:web": "npm run dev --workspace=apps/web",
+    "build:web": "npm run build --workspace=apps/web"
   }
 }

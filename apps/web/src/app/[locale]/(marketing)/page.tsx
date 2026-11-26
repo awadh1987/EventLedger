@@ -22,8 +22,12 @@ export default function SaasLandingPage() {
     });
     const data = await res.json();
     if (data?.slug) {
-      const root = (process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'eventledger.local').split(':')[0];
-      window.location.href = `${window.location.protocol}//${data.slug}.${root}/${locale}/erp/dashboard`;
+      const configuredRoot = process.env.NEXT_PUBLIC_ROOT_DOMAIN?.split(':')[0];
+      if (configuredRoot) {
+        window.location.href = `${window.location.protocol}//${data.slug}.${configuredRoot}/${locale}/dashboard`;
+      } else {
+        window.location.href = `/${locale}/dashboard`;
+      }
     }
   };
 
