@@ -1,0 +1,11 @@
+{
+  "name": "EventLedger",
+  "description": "Bilingual multi-tenant Venue, Wedding Hall & Conference Operations Cloud ERP with Cloud SQL persistence, real-time voice concierge, Maps vendor discovery, and multi-turn AI operations assistant.",
+  "requestFramePermissions": [
+    "microphone",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
