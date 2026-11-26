@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 48" fill="none">
+  <rect x="2" y="2" width="44" height="44" rx="11" fill="#0F172A" stroke="#D4AF37" stroke-width="1.75"/>
+  <path d="M12 14H24V18H16.2V21.8H22.8V25.6H16.2V29.8H24V34H12V14Z" fill="#D4AF37"/>
+  <path d="M27 14H31.2V29.8H37V34H27V14Z" fill="#10B981"/>
+  <text x="56" y="25" fill="#F8FAFC" font-family="system-ui, -apple-system, sans-serif" font-size="18" font-weight="800" letter-spacing="0.3">EventLedger</text>
+  <text x="56" y="39" fill="#D4AF37" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" letter-spacing="1.4">VENUE SAAS ERP</text>
+</svg>

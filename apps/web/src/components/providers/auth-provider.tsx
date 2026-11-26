@@ -25,6 +25,7 @@ interface AuthContextValue {
   switchWorkspace: (nextSlug: string, locale?: string) => void;
   refreshUser: () => Promise<void>;
   setSession: (token: string, user: AuthUser, slug?: string) => void;
+  loginSession: (token: string, user: AuthUser, slug?: string) => void;
   logout: (redirectLocale?: string) => void;
 }
 
@@ -37,6 +38,7 @@ const AuthContext = createContext<AuthContextValue>({
   switchWorkspace: () => undefined,
   refreshUser: async () => undefined,
   setSession: () => undefined,
+  loginSession: () => undefined,
   logout: () => undefined,
 });
 
@@ -175,6 +177,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         switchWorkspace,
         refreshUser,
         setSession,
+        loginSession: setSession,
         logout,
       }}
     >

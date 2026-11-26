@@ -4,94 +4,110 @@ import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useParams, usePathname } from 'next/navigation';
 import { useTheme } from 'next-themes';
-import { Building2, Globe, LogIn, LogOut, Moon, Sun, UserCheck } from 'lucide-react';
+import { Globe, LogIn, Moon, Sun } from 'lucide-react';
 import { useAuthSession } from '@/components/providers/auth-provider';
 import { useTenantBranding } from '@/components/providers/theme-branding-provider';
 import { tenantPath } from '@/lib/api';
 
-interface NavLinkItem {
+interface NavTab {
+  key: string;
   href: string;
   labelAr: string;
   labelEn: string;
+  /** Path (without locale / tenant prefix) that marks this tab active. */
+  match?: RegExp;
+  /** Hash that marks a landing-page section tab active. */
+  hash?: string;
 }
+
+const TENANT_PATH_RE = /^\/(?:ar|en)\/t\/[a-z0-9-]+/i;
+const WORKSPACE_PATH_RE = /^\/(?:ar|en)\/(?:venue|portal|erp|gate|staff-login)(?:\/|$)/i;
 
 export function AppHeader({ locale: propLocale, title }: { locale?: 'ar' | 'en'; title?: string }) {
   const [mounted, setMounted] = useState(false);
-  const [customOpen, setCustomOpen] = useState(false);
-  const [customSlug, setCustomSlug] = useState('');
+  const [hash, setHash] = useState('');
 
   useEffect(() => {
     setMounted(true);
+    const sync = () => setHash(window.location.hash);
+    sync();
+    window.addEventListener('hashchange', sync);
+    return () => window.removeEventListener('hashchange', sync);
   }, []);
 
   const params = useParams<{ locale?: string }>();
   const locale: 'ar' | 'en' = propLocale || (params?.locale === 'en' ? 'en' : 'ar');
   const isRtl = locale === 'ar';
+  const tr = (ar: string, en: string) => (isRtl ? ar : en);
 
   const pathname = usePathname() || `/${locale}`;
   const { resolvedTheme, setTheme } = useTheme();
   const branding = useTenantBranding();
-  const { user, isAuthenticated, tenantSlug, knownSlugs, switchWorkspace, logout } = useAuthSession();
+  const { user, tenantSlug, logout } = useAuthSession();
 
   const targetLocale = isRtl ? 'en' : 'ar';
   const switchedPath = pathname.replace(/^\/(ar|en)(?=\/|$)/, `/${targetLocale}`);
 
-  const activeSlug = mounted ? tenantSlug : 'almassa';
-  const isMarketingRoot = /^\/(ar|en)\/?$/.test(pathname);
+  // Context separation: EventLedger platform pages vs. a venue (<slug>) workspace.
+  const isTenantCtx = TENANT_PATH_RE.test(pathname) || WORKSPACE_PATH_RE.test(pathname);
+  const slug = isTenantCtx ? tenantSlug : null;
+  const isStaff = user?.user_type === 'INTERNAL_STAFF' || user?.user_type === 'SUPER_ADMIN';
 
-  const publicMarketingLinks: NavLinkItem[] = [
-    { href: `/${locale}#capabilities`, labelAr: 'القدرات', labelEn: 'Capabilities' },
-    { href: `/${locale}#pricing`, labelAr: 'الباقات والأسعار', labelEn: 'Pricing' },
-    { href: tenantPath(locale, activeSlug, '/venue'), labelAr: 'حجز القاعات', labelEn: 'Venue Booking' },
-    { href: tenantPath(locale, activeSlug, '/erp/dashboard'), labelAr: 'النظام التجريبي ERP', labelEn: 'Live ERP' },
-  ];
+  // Path relative to the locale + tenant prefix, e.g. "/portal/dashboard".
+  const relPath = pathname.replace(/^\/(?:ar|en)(?:\/t\/[a-z0-9-]+)?/i, '') || '/';
+  const base = `/${locale}`;
 
-  const getAuthenticatedLinks = (): NavLinkItem[] => {
-    if (!user) return publicMarketingLinks;
-    if (user.user_type === 'SUPER_ADMIN') {
-      return [
-        { href: `/${locale}/admin`, labelAr: 'إدارة المنصة', labelEn: 'Super Admin' },
-        { href: tenantPath(locale, activeSlug, '/erp/dashboard'), labelAr: 'لوحة الإدارة', labelEn: 'ERP Hub' },
-        { href: tenantPath(locale, activeSlug, '/erp/finance/ledger'), labelAr: 'دفتر الأستاذ', labelEn: 'Ledger' },
-        { href: tenantPath(locale, activeSlug, '/venue'), labelAr: 'واجهة القاعة', labelEn: 'Storefront' },
-      ];
-    }
-    if (user.user_type === 'INTERNAL_STAFF') {
-      return [
-        { href: tenantPath(locale, activeSlug, '/erp/dashboard'), labelAr: 'لوحة الإدارة', labelEn: 'ERP Hub' },
-        { href: tenantPath(locale, activeSlug, '/erp/finance/ledger'), labelAr: 'دفتر الأستاذ', labelEn: 'Ledger' },
-        { href: tenantPath(locale, activeSlug, '/erp/ops/beo'), labelAr: 'التشغيل BEO', labelEn: 'Live BEO' },
-        { href: tenantPath(locale, activeSlug, '/erp/settings/branding'), labelAr: 'الهوية البصرية', labelEn: 'Branding' },
-        { href: tenantPath(locale, activeSlug, '/gate'), labelAr: 'البوابة الأمنية', labelEn: 'Gate' },
-      ];
-    }
-    return [
-      { href: tenantPath(locale, activeSlug, '/portal/dashboard'), labelAr: 'بوابة العميل', labelEn: 'Client Portal' },
-      { href: tenantPath(locale, activeSlug, '/venue'), labelAr: 'حجز القاعات', labelEn: 'Venue Booking' },
+  let tabs: NavTab[];
+  if (!isTenantCtx) {
+    tabs = [
+      { key: 'calendar', href: `${base}#booking-calendar`, labelAr: 'تقويم الحجز لثلاثة أشهر', labelEn: '3-Month Booking Calendar', hash: '#booking-calendar' },
+      { key: 'venues', href: `${base}#venues`, labelAr: 'القاعات النشطة', labelEn: 'Active Venues', hash: '#venues' },
+      { key: 'experience', href: `${base}#experience`, labelAr: 'لماذا إيفنت ليدجر', labelEn: 'Why EventLedger', hash: '#experience' },
     ];
+  } else {
+    tabs = [
+      { key: 'store', href: tenantPath(locale, slug, '/venue'), labelAr: 'واجهة الحجز', labelEn: 'Booking Storefront', match: /^\/venue(\/|$)/ },
+      { key: 'portal', href: tenantPath(locale, slug, '/portal/dashboard'), labelAr: 'بوابة العميل', labelEn: 'Client Portal', match: /^\/portal(\/|$)/ },
+      ...(isStaff
+        ? [{ key: 'erp', href: tenantPath(locale, slug, '/erp/dashboard'), labelAr: 'لوحة التحكم ERP', labelEn: 'ERP Control Panel', match: /^\/(erp|gate)(\/|$)/ }]
+        : []),
+      { key: 'home', href: base, labelAr: 'الصفحة الرئيسية للمنصة', labelEn: 'SaaS Home' },
+    ];
+  }
+
+  const isActive = (tab: NavTab): boolean => {
+    if (tab.hash) return relPath === '/' && mounted && hash === tab.hash;
+    if (tab.match) return tab.match.test(relPath);
+    return false;
   };
 
-  const navLinks = mounted && isAuthenticated && !isMarketingRoot ? getAuthenticatedLinks() : publicMarketingLinks;
-  const roleLabel = user ? user.staff_role || user.user_type : null;
+  const tenantName = branding.venueName;
+  const logoSrc = resolvedTheme === 'dark' ? branding.logoDarkUrl || branding.logoLightUrl : branding.logoLightUrl || branding.logoDarkUrl;
 
-  const handleWorkspaceChange = (value: string) => {
-    if (value === '__custom__') {
-      setCustomOpen(true);
-      return;
-    }
-    setCustomOpen(false);
-    switchWorkspace(value, locale);
-  };
+  const brandHref = isTenantCtx ? tenantPath(locale, slug, '/venue') : base;
+  const brandLabel = title || (isTenantCtx ? tenantName : tr('إيفنت ليدجر', 'EventLedger'));
 
-  const handleCustomSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const clean = customSlug.trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
-    if (clean.length >= 2) {
-      setCustomOpen(false);
-      setCustomSlug('');
-      switchWorkspace(clean, locale);
-    }
-  };
+  const ctaHref = tenantPath(locale, slug, '/venue');
+  const ctaLabel = isStaff ? tr('+ حجز جديد', '+ New Booking') : tr('احجز قاعة', 'Reserve a Hall');
+  const signInHref = isTenantCtx ? tenantPath(locale, slug, '/portal/login') : `${base}/login`;
+  const signUpHref = isTenantCtx ? `${tenantPath(locale, slug, '/portal/login')}?tab=register` : `${base}/login?tab=register`;
+
+  const tabClass = (active: boolean) =>
+    `whitespace-nowrap border-b-2 px-1 py-5 text-xs transition ${
+      active
+        ? 'border-[var(--brand-primary)] font-semibold text-slate-900 dark:text-white'
+        : 'border-transparent font-medium text-slate-600 hover:text-[var(--brand-primary,#D4AF37)] dark:text-slate-300'
+    }`;
+
+  const renderTabs = (extra = '') =>
+    tabs.map((tab) => {
+      const active = isActive(tab);
+      return (
+        <Link key={tab.key} href={tab.href} aria-current={active ? 'page' : undefined} className={`${tabClass(active)} ${extra}`}>
+          {isRtl ? tab.labelAr : tab.labelEn}
+        </Link>
+      );
+    });
 
   return (
     <header
@@ -99,74 +115,37 @@ export function AppHeader({ locale: propLocale, title }: { locale?: 'ar' | 'en';
       className="sticky top-0 z-40 border-b border-slate-200/80 bg-white/90 backdrop-blur-md dark:border-slate-800 dark:bg-slate-950/90"
     >
       <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-3 px-4 sm:px-6">
-        <Link href={`/${locale}`} className="flex shrink-0 items-center gap-2.5 font-bold">
-          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[var(--brand-primary,#D4AF37)] text-xs font-extrabold text-slate-950">
-            EL
-          </span>
-          <span className="text-start text-sm sm:text-base">
-            {title || (isRtl ? 'إيفنت ليدجر' : branding.venueName || 'EventLedger')}
-          </span>
+        <Link href={brandHref} className="flex shrink-0 items-center gap-2.5 font-bold">
+          {!isTenantCtx ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src="/brand/eventledger-logo.svg"
+              alt="EventLedger"
+              className="h-9 w-auto max-w-[170px] object-contain"
+            />
+          ) : mounted && logoSrc ? (
+            <>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={logoSrc} alt={tenantName} className="h-8 w-auto max-w-[120px] rounded-md object-contain" />
+              <span className="max-w-[180px] truncate text-start text-sm sm:text-base">{brandLabel}</span>
+            </>
+          ) : (
+            <>
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[var(--brand-primary,#D4AF37)] text-xs font-extrabold text-slate-950">
+                {mounted ? tenantName.trim().charAt(0).toUpperCase() || 'V' : 'EL'}
+              </span>
+              <span className="max-w-[180px] truncate text-start text-sm sm:text-base">
+                {mounted ? brandLabel : 'EventLedger'}
+              </span>
+            </>
+          )}
         </Link>
 
-        <nav className="hidden items-center gap-5 text-xs font-medium text-slate-600 dark:text-slate-300 lg:flex">
-          {navLinks.map((item) => (
-            <Link
-              key={item.href}
-              href={item.href}
-              className="whitespace-nowrap transition hover:text-[var(--brand-primary,#D4AF37)]"
-            >
-              {isRtl ? item.labelAr : item.labelEn}
-            </Link>
-          ))}
+        <nav className="hidden items-stretch gap-5 lg:flex" aria-label="Primary">
+          {renderTabs()}
         </nav>
 
         <div className="flex items-center gap-2">
-          {/* Active <slug> Workspace Switcher */}
-          <div className="relative hidden items-center gap-1 rounded-lg border border-slate-300 bg-slate-100 px-2 py-1 text-xs dark:border-slate-800 dark:bg-slate-900 sm:flex">
-            <Building2 className="h-3.5 w-3.5 shrink-0 text-[var(--brand-primary,#D4AF37)]" />
-            {mounted ? (
-              customOpen ? (
-                <form onSubmit={handleCustomSubmit} className="flex items-center gap-1">
-                  <input
-                    value={customSlug}
-                    onChange={(e) => setCustomSlug(e.target.value)}
-                    placeholder="slug"
-                    dir="ltr"
-                    className="w-24 rounded border border-slate-300 bg-white px-1.5 py-0.5 font-mono text-[11px] dark:border-slate-700 dark:bg-slate-950"
-                  />
-                  <button
-                    type="submit"
-                    className="rounded bg-[var(--brand-primary,#D4AF37)] px-1.5 py-0.5 text-[10px] font-bold text-slate-950"
-                  >
-                    OK
-                  </button>
-                </form>
-              ) : (
-                <select
-                  aria-label={isRtl ? 'تبديل مساحة العمل' : 'Switch Workspace'}
-                  value={activeSlug}
-                  onChange={(e) => handleWorkspaceChange(e.target.value)}
-                  dir="ltr"
-                  className="bg-transparent pe-1 font-mono text-xs font-semibold text-slate-800 focus:outline-none dark:text-slate-200"
-                >
-                  {Array.from(new Set([...knownSlugs, activeSlug])).map((s) => (
-                    <option key={s} value={s} className="bg-white text-slate-900 dark:bg-slate-900 dark:text-slate-100">
-                      /{s}
-                    </option>
-                  ))}
-                  <option value="__custom__" className="bg-white text-slate-900 dark:bg-slate-900 dark:text-slate-100">
-                    {isRtl ? '+ نطاق آخر...' : '+ Other slug...'}
-                  </option>
-                </select>
-              )
-            ) : (
-              <span dir="ltr" className="pe-1 font-mono text-xs font-semibold text-slate-700 dark:text-slate-200">
-                /almassa
-              </span>
-            )}
-          </div>
-
-          {/* Theme Toggle guarded by mounted */}
           <button
             type="button"
             onClick={() => setTheme(resolvedTheme === 'dark' ? 'light' : 'dark')}
@@ -174,17 +153,12 @@ export function AppHeader({ locale: propLocale, title }: { locale?: 'ar' | 'en';
             className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-300 bg-slate-100 text-slate-700 transition hover:border-[var(--brand-primary,#D4AF37)] dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200"
           >
             {mounted ? (
-              resolvedTheme === 'dark' ? (
-                <Sun className="h-4 w-4 text-amber-400" />
-              ) : (
-                <Moon className="h-4 w-4 text-slate-700" />
-              )
+              resolvedTheme === 'dark' ? <Sun className="h-4 w-4 text-amber-400" /> : <Moon className="h-4 w-4 text-slate-700" />
             ) : (
               <span className="h-4 w-4" />
             )}
           </button>
 
-          {/* Locale Switcher */}
           <Link
             href={switchedPath}
             className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-slate-300 bg-slate-100 px-3 text-xs font-semibold text-slate-700 transition hover:border-[var(--brand-primary,#D4AF37)] dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200"
@@ -193,40 +167,52 @@ export function AppHeader({ locale: propLocale, title }: { locale?: 'ar' | 'en';
             <span>{isRtl ? 'EN' : 'عربي'}</span>
           </Link>
 
-          {/* Authenticated User Badge + Logout OR Login */}
+          {isTenantCtx && (
+            <Link
+              href={ctaHref}
+              className="hidden h-9 shrink-0 items-center rounded-lg bg-[var(--brand-primary,#D4AF37)] px-3.5 text-xs font-bold text-slate-950 shadow transition hover:opacity-90 sm:inline-flex"
+            >
+              {ctaLabel}
+            </Link>
+          )}
+
           {mounted && user ? (
-            <div className="flex items-center gap-2">
-              <div className="hidden items-center gap-1.5 rounded-lg border border-slate-300 bg-slate-100 px-2.5 py-1.5 text-xs dark:border-slate-800 dark:bg-slate-900 md:flex">
-                <UserCheck className="h-3.5 w-3.5 text-emerald-500" />
-                <span className="max-w-[120px] truncate font-semibold text-slate-800 dark:text-slate-200">
-                  {user.full_name}
-                </span>
-                {roleLabel && (
-                  <span className="rounded bg-[var(--brand-primary,#D4AF37)]/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-[var(--brand-primary,#D4AF37)]">
-                    {roleLabel}
-                  </span>
-                )}
-              </div>
+            <div className="flex items-center gap-1.5 rounded-lg border border-slate-300 bg-slate-100 py-1 ps-2.5 pe-1 text-xs dark:border-slate-800 dark:bg-slate-900">
+              <span className="max-w-[140px] truncate font-semibold text-slate-800 dark:text-slate-200">{user.full_name}</span>
               <button
                 type="button"
                 onClick={() => logout(locale)}
-                className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-xs font-bold text-rose-600 transition hover:bg-rose-500/20 dark:text-rose-400"
+                aria-label={tr('تسجيل الخروج', 'Log out')}
+                title={tr('تسجيل الخروج', 'Log out')}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-md text-sm font-bold text-rose-600 transition hover:bg-rose-500/15 dark:text-rose-400"
               >
-                <LogOut className="h-3.5 w-3.5" />
-                <span>{isRtl ? 'خروج' : 'Logout'}</span>
+                ⇥
               </button>
             </div>
           ) : (
-            <Link
-              href={`/${locale}/login`}
-              className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg bg-[var(--brand-primary,#D4AF37)] px-3.5 text-xs font-bold text-slate-950 shadow transition hover:opacity-90"
-            >
-              <LogIn className="h-3.5 w-3.5" />
-              <span>{isRtl ? 'دخول' : 'Login'}</span>
-            </Link>
+            <div className="flex items-center gap-2">
+              <Link
+                href={signInHref}
+                className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-slate-300 px-3 text-xs font-semibold text-slate-800 transition hover:border-[var(--brand-primary,#D4AF37)] dark:border-slate-700 dark:text-white"
+              >
+                <LogIn className="h-3.5 w-3.5" />
+                <span>{tr('تسجيل الدخول', 'Sign In')}</span>
+              </Link>
+              <Link
+                href={signUpHref}
+                className="inline-flex h-9 shrink-0 items-center rounded-lg bg-[var(--brand-primary,#D4AF37)] px-3.5 text-xs font-bold text-slate-950 shadow transition hover:opacity-90"
+              >
+                {tr('إنشاء حساب', 'Create Account')}
+              </Link>
+            </div>
           )}
         </div>
       </div>
+
+      {/* Mobile / tablet tab strip */}
+      <nav className="flex gap-5 overflow-x-auto border-t border-slate-200/60 px-4 dark:border-slate-800/60 lg:hidden" aria-label="Primary mobile">
+        {renderTabs('!py-3')}
+      </nav>
     </header>
   );
 }

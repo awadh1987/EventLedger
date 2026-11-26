@@ -3,7 +3,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -376,15 +376,74 @@ async def list_audit_logs(
     ]
 
 
+ALLOWED_RECEIPT_EXT = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
+MAX_RECEIPT_BYTES = 8 * 1024 * 1024
+
+
+async def save_milestone_receipt(
+    db: AsyncSession,
+    milestone: PaymentMilestone,
+    upload: UploadFile,
+    payment_method: Optional[str],
+    transfer_reference: Optional[str],
+    actor_id: Optional[uuid.UUID] = None,
+) -> dict:
+    """Validate + store a receipt, flag the milestone UNDER_REVIEW and commit."""
+    ext = Path(upload.filename or "receipt.jpg").suffix.lower() or ".jpg"
+    if ext not in ALLOWED_RECEIPT_EXT:
+        raise HTTPException(status_code=400, detail="Unsupported receipt file type")
+    data = await upload.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty receipt file")
+    if len(data) > MAX_RECEIPT_BYTES:
+        raise HTTPException(status_code=413, detail="Receipt file too large (max 8MB)")
+
+    upload_dir = Path(settings.UPLOAD_DIR) / "receipts"
+    os.makedirs(upload_dir, exist_ok=True)
+    fname = f"{milestone.id}_{uuid.uuid4().hex[:8]}{ext}"
+    (upload_dir / fname).write_bytes(data)
+
+    milestone.receipt_url = f"/uploads/receipts/{fname}"
+    milestone.status = "UNDER_REVIEW"
+    if payment_method and payment_method.strip():
+        milestone.payment_method = payment_method.strip()[:60]
+    ref = (transfer_reference or "").strip()[:80]
+    if ref and ref not in milestone.title:
+        milestone.title = f"{milestone.title} | Ref: {ref}"[:255]
+    if actor_id:
+        db.add(
+            AuditLog(
+                tenant_id=milestone.tenant_id,
+                actor_id=actor_id,
+                action="MILESTONE_RECEIPT_UPLOADED",
+                new_value={"milestone_id": str(milestone.id), "transfer_reference": ref or None},
+            )
+        )
+    await db.commit()
+    return {
+        "status": "UNDER_REVIEW",
+        "milestone_id": str(milestone.id),
+        "receipt_url": milestone.receipt_url,
+        "payment_method": milestone.payment_method,
+        "transfer_reference": ref or None,
+    }
+
+
 @portal_router.post("/milestones/{milestone_id}/receipt")
 async def upload_milestone_receipt(
     milestone_id: uuid.UUID,
-    file: UploadFile = File(...),
+    receipt: Optional[UploadFile] = File(default=None),
+    file: Optional[UploadFile] = File(default=None),
+    payment_method: Optional[str] = Form(default=None),
+    transfer_reference: Optional[str] = Form(default=None),
     auth: AuthContext = Depends(get_current_auth),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    upload = receipt or file
+    if upload is None:
+        raise HTTPException(status_code=422, detail="receipt file is required")
     milestone = (
         await db.execute(
             select(PaymentMilestone).where(
@@ -395,18 +454,7 @@ async def upload_milestone_receipt(
     ).scalar_one_or_none()
     if not milestone:
         raise HTTPException(status_code=404, detail="Milestone not found")
-
-    upload_dir = Path(settings.UPLOAD_DIR) / "receipts"
-    os.makedirs(upload_dir, exist_ok=True)
-    ext = Path(file.filename or "receipt.jpg").suffix or ".jpg"
-    fname = f"{milestone_id}_{uuid.uuid4().hex[:8]}{ext}"
-    dest = upload_dir / fname
-    dest.write_bytes(await file.read())
-
-    milestone.receipt_url = f"/uploads/receipts/{fname}"
-    milestone.status = "UNDER_REVIEW"
-    await db.commit()
-    return {"status": "UNDER_REVIEW", "receipt_url": milestone.receipt_url}
+    return await save_milestone_receipt(db, milestone, upload, payment_method, transfer_reference, auth.user.id)
 
 
 @portal_router.get("/payment-accounts")

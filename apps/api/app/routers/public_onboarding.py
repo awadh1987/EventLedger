@@ -215,6 +215,17 @@ async def register_tenant(payload: TenantRegisterRequest, db: AsyncSession = Dep
         "workspace_url": f"http://{tenant.slug}.{root_domain}",
         "owner_id": str(owner.id),
         "access_token": token,
+        "user": {
+            "id": str(owner.id),
+            "tenant_id": str(tenant.id),
+            "full_name": owner.full_name,
+            "email": owner.email,
+            "phone": owner.phone,
+            "user_type": owner.user_type.value,
+            "staff_role": StaffRole.OWNER.value,
+            "preferred_lang": owner.preferred_lang,
+            "is_2fa_enabled": owner.is_2fa_enabled,
+        },
     }
 
 

@@ -1,10 +1,17 @@
 import React from 'react';
+import type { Metadata } from 'next';
 import arMessages from '@/messages/ar.json';
 import enMessages from '@/messages/en.json';
 import { IntlProvider } from '@/components/providers/intl-provider';
 import { ThemeBrandingProvider } from '@/components/providers/theme-branding-provider';
 import { AuthProvider } from '@/components/providers/auth-provider';
 import { LocaleDirSync } from '@/components/providers/locale-dir-sync';
+
+export const metadata: Metadata = {
+  icons: {
+    icon: '/favicon.svg',
+  },
+};
 
 export function generateStaticParams() {
   return [{ locale: 'ar' }, { locale: 'en' }];
