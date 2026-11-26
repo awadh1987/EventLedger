@@ -9,6 +9,7 @@ import {
   Check,
   CheckCircle2,
   ClipboardList,
+  Copy,
   CreditCard,
   Download,
   FileText,
@@ -71,11 +72,11 @@ interface ApprovalDraftRecord {
   id: string;
   eventId: string;
   eventCode: string;
+  draftType: string;
   requestedByName: string;
   titleEn: string;
   titleAr: string;
-  changeSummaryEn: string;
-  changeSummaryAr: string;
+  notes: string;
   financialDelta: number;
   currency: string;
   status: string;
@@ -89,15 +90,16 @@ interface GatePassRecord {
   holderName: string;
   holderIdNumber: string;
   qrToken: string;
-  checkedIn: boolean;
+  isCheckedIn: boolean;
+  checkedInAt: string | null;
 }
 
 interface AuditLogRecord {
-  id: string;
+  id: number;
   actorName: string;
-  eventCode: string;
+  eventCode: string | null;
   action: string;
-  details: Record<string, unknown>;
+  details: Record<string, unknown> | null;
   createdAt: string;
 }
 
@@ -176,6 +178,7 @@ export default function ClientPortalDashboard() {
   const [payingTarget, setPayingTarget] = useState<{ invoiceId: string; milestoneId: string; amount: number; currency: string } | null>(null);
   const [payMethodCode, setPayMethodCode] = useState('KURAIMI_BANK');
   const [payRef, setPayRef] = useState('');
+  const [copiedAccount, setCopiedAccount] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   // Delegate form state
@@ -404,7 +407,7 @@ export default function ClientPortalDashboard() {
   };
 
   const pendingDraftsCount = useMemo(
-    () => drafts.filter((d) => d.status === 'PENDING_APPROVAL').length,
+    () => drafts.filter((d) => d.status === 'PENDING').length,
     [drafts]
   );
 
@@ -694,14 +697,14 @@ export default function ClientPortalDashboard() {
                           </div>
 
                           <p className="mt-2 text-xs leading-relaxed text-slate-600 dark:text-slate-400">
-                            {isRtl ? draft.changeSummaryAr : draft.changeSummaryEn}
+                            {draft.notes || draft.draftType}
                           </p>
 
                           <div className="mt-4 flex items-center justify-between border-t border-slate-200 pt-3 dark:border-slate-800">
                             <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">
                               {draft.status}
                             </span>
-                            {draft.status === 'PENDING_APPROVAL' && (
+                            {draft.status === 'PENDING' && (
                               <div className="flex items-center gap-2">
                                 <button
                                   type="button"
@@ -1243,10 +1246,10 @@ export default function ClientPortalDashboard() {
                           </div>
                           <div
                             className={`text-[11px] font-semibold ${
-                              pass.checkedIn ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-[#D4AF37]'
+                              pass.isCheckedIn ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-[#D4AF37]'
                             }`}
                           >
-                            {pass.checkedIn
+                            {pass.isCheckedIn
                               ? isRtl
                                 ? 'تم تسجيل الدخول عبر البوابة'
                                 : 'Checked In at Gate'
@@ -1316,7 +1319,10 @@ export default function ClientPortalDashboard() {
                 </label>
                 <select
                   value={payMethodCode}
-                  onChange={(e) => setPayMethodCode(e.target.value)}
+                  onChange={(e) => {
+                    setPayMethodCode(e.target.value);
+                    setCopiedAccount(false);
+                  }}
                   className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-950"
                 >
                   {paymentMethods.map((pm) => (
@@ -1325,6 +1331,29 @@ export default function ClientPortalDashboard() {
                     </option>
                   ))}
                 </select>
+                {(() => {
+                  const chosen = paymentMethods.find((m) => m.code === payMethodCode);
+                  if (!chosen) return null;
+                  return (
+                    <div className="mt-2 flex items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs dark:border-slate-800 dark:bg-slate-950">
+                      <span className="font-mono font-semibold" dir="ltr">{chosen.accountNumber}</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (typeof navigator !== 'undefined' && navigator.clipboard) {
+                            navigator.clipboard.writeText(chosen.accountNumber).catch(() => undefined);
+                          }
+                          setCopiedAccount(true);
+                          setTimeout(() => setCopiedAccount(false), 2000);
+                        }}
+                        className="inline-flex items-center gap-1 rounded border border-slate-300 px-2 py-1 text-[11px] font-medium dark:border-slate-700"
+                      >
+                        {copiedAccount ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
+                        <span>{copiedAccount ? (isRtl ? 'تم النسخ' : 'Copied') : isRtl ? 'نسخ الرقم' : 'Copy #'}</span>
+                      </button>
+                    </div>
+                  );
+                })()}
               </div>
 
               <div>

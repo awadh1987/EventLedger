@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { buildInitialEvents, VENUE_HALLS } from '@/lib/bookings-store';
 import { verifyFirebaseAuth } from '@/lib/firebase-admin';
+import { calculateVenueQuote } from '@/lib/pricing-quote';
 import {
   ensureSeededVenueData,
   findDbScheduleConflict,
@@ -140,42 +141,55 @@ export async function POST(req: NextRequest) {
 
     const [branding, catalog] = await Promise.all([getTenantBrandingRecord(), listCatalogData()]);
 
-    // Build itemized quote & invoice lines
-    const dow = startDate.getDay();
-    const isWeekendPeak = dow === 4 || dow === 5;
-    const hallPrice = Math.round(hall.basePrice * (isWeekendPeak ? 1.2 : 1.0));
+    const selectedMenu = cateringMenuId
+      ? catalog.cateringMenus.find((m) => m.id === cateringMenuId)
+      : undefined;
+
+    const resolvedAddons = addonSelections
+      .map((sel) => {
+        const qty = Math.max(0, Math.round(Number(sel.quantity || 0)));
+        const item = catalog.inventoryItems.find((i) => i.id === sel.id);
+        return item && qty > 0 ? { item, qty } : null;
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+
+    const quote = calculateVenueQuote({
+      hallBasePrice: hall.basePrice,
+      eventDate,
+      startHour,
+      guestCount,
+      cateringPricePerGuest: selectedMenu?.pricePerGuest,
+      addons: resolvedAddons.map(({ item, qty }) => ({
+        unitPrice: item.unitAddonPrice,
+        quantity: qty,
+      })),
+      taxRate: branding.taxRate,
+      defaultSecurityDeposit: branding.defaultSecurityDeposit,
+    });
 
     const lineItems: InvoiceLineItem[] = [
       {
         id: 'li-hall',
-        descriptionEn: `${hall.nameEn}${isWeekendPeak ? ' (Weekend Peak +20%)' : ''}`,
-        descriptionAr: `${hall.nameAr}${isWeekendPeak ? ' (ذروة نهاية الأسبوع +20%)' : ''}`,
+        descriptionEn: `${hall.nameEn}${quote.isWeekendPeak ? ' (Weekend Peak +20%)' : ''}`,
+        descriptionAr: `${hall.nameAr}${quote.isWeekendPeak ? ' (ذروة نهاية الأسبوع +20%)' : ''}`,
         quantity: 1,
-        unitPrice: hallPrice,
-        total: hallPrice,
+        unitPrice: quote.hallTotal,
+        total: quote.hallTotal,
       },
     ];
 
-    if (cateringMenuId) {
-      const menu = catalog.cateringMenus.find((m) => m.id === cateringMenuId);
-      if (menu) {
-        const menuTotal = menu.pricePerGuest * guestCount;
-        lineItems.push({
-          id: `li-cat-${menu.id}`,
-          descriptionEn: `${menu.nameEn} (${guestCount} guests)`,
-          descriptionAr: `${menu.nameAr} (${guestCount} ضيفاً)`,
-          quantity: guestCount,
-          unitPrice: menu.pricePerGuest,
-          total: menuTotal,
-        });
-      }
+    if (selectedMenu) {
+      lineItems.push({
+        id: `li-cat-${selectedMenu.id}`,
+        descriptionEn: `${selectedMenu.nameEn} (${guestCount} guests)`,
+        descriptionAr: `${selectedMenu.nameAr} (${guestCount} ضيفاً)`,
+        quantity: guestCount,
+        unitPrice: selectedMenu.pricePerGuest,
+        total: quote.cateringTotal,
+      });
     }
 
-    for (const sel of addonSelections) {
-      const qty = Math.max(0, Math.round(Number(sel.quantity || 0)));
-      if (qty <= 0) continue;
-      const item = catalog.inventoryItems.find((i) => i.id === sel.id);
-      if (!item) continue;
+    for (const { item, qty } of resolvedAddons) {
       lineItems.push({
         id: `li-addon-${item.id}`,
         descriptionEn: item.nameEn,
@@ -186,11 +200,11 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const subtotal = lineItems.reduce((sum, li) => sum + li.total, 0);
-    const taxRate = branding.taxRate;
-    const taxAmount = Math.round((subtotal * taxRate) / 100);
-    const totalAmount = subtotal + taxAmount;
-    const half = Math.round(totalAmount * 0.5);
+    const subtotal = quote.subtotal;
+    const taxRate = quote.taxRate;
+    const taxAmount = quote.taxAmount;
+    const totalAmount = quote.grandTotal;
+    const half = quote.confirmationDeposit;
 
     const year = startDate.getFullYear();
     const suffix = String(Date.now()).slice(-4);

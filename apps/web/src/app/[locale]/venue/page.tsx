@@ -11,6 +11,7 @@ import {
   Calendar,
   Check,
   CheckCircle2,
+  Copy,
   CreditCard,
   Download,
   FileText,
@@ -27,6 +28,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '@/components/providers/auth-provider';
 import { useTenantBranding, type TenantBrandingConfig } from '@/components/providers/theme-branding-provider';
+import { calculateVenueQuote } from '@/lib/pricing-quote';
 import {
   downloadInvoiceHtml,
   printInvoicePdf,
@@ -42,7 +44,6 @@ interface StorefrontHall {
   capacityBanquet: number;
   basePrice: number;
   cleaningBufferMinutes: number;
-  accentHex: string;
 }
 
 interface StorefrontMenu {
@@ -53,17 +54,15 @@ interface StorefrontMenu {
   descriptionAr: string;
   pricePerGuest: number;
   costPerGuest: number;
-  minGuests: number;
   isActive: boolean;
 }
 
 interface StorefrontAddon {
   id: string;
-  sku: string;
   nameEn: string;
   nameAr: string;
   category: string;
-  totalQuantity: number;
+  totalStock: number;
   unitAddonPrice: number;
   isActive: boolean;
 }
@@ -144,6 +143,15 @@ export default function TenantVenueStorefrontPage() {
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<BookingConfirmation | null>(null);
+  const [copiedMethodId, setCopiedMethodId] = useState<string | null>(null);
+
+  const handleCopyAccount = (id: string, accountNumber: string) => {
+    if (typeof navigator !== 'undefined' && navigator.clipboard) {
+      navigator.clipboard.writeText(accountNumber).catch(() => undefined);
+    }
+    setCopiedMethodId(id);
+    setTimeout(() => setCopiedMethodId((curr) => (curr === id ? null : curr)), 2000);
+  };
 
   useEffect(() => {
     setMounted(true);
@@ -203,35 +211,19 @@ export default function TenantVenueStorefrontPage() {
   );
 
   const quote = useMemo(() => {
-    const dt = new Date(`${eventDate}T${startHour}:00`);
-    const dow = Number.isNaN(dt.getTime()) ? 0 : dt.getDay();
-    const isWeekendPeak = dow === 4 || dow === 5;
-    const baseHallPrice = selectedHall ? selectedHall.basePrice : 0;
-    const hallTotal = Math.round(baseHallPrice * (isWeekendPeak ? 1.2 : 1.0));
-    const cateringTotal = selectedMenu ? selectedMenu.pricePerGuest * guestCount : 0;
-    const addonsTotal = addons.reduce((sum, item) => {
-      const q = addonQty[item.id] || 0;
-      return sum + q * item.unitAddonPrice;
-    }, 0);
-    const subtotal = hallTotal + cateringTotal + addonsTotal;
-    const taxRate = branding.taxRate ?? 5;
-    const taxAmount = Math.round((subtotal * taxRate) / 100);
-    const grandTotal = subtotal + taxAmount;
-    const confirmationDeposit = Math.round(grandTotal * 0.5);
-    const securityDeposit = branding.defaultSecurityDeposit ?? 150000;
-
-    return {
-      isWeekendPeak,
-      hallTotal,
-      cateringTotal,
-      addonsTotal,
-      subtotal,
-      taxRate,
-      taxAmount,
-      grandTotal,
-      confirmationDeposit,
-      securityDeposit,
-    };
+    return calculateVenueQuote({
+      hallBasePrice: selectedHall ? selectedHall.basePrice : 0,
+      eventDate,
+      startHour,
+      guestCount,
+      cateringPricePerGuest: selectedMenu ? selectedMenu.pricePerGuest : 0,
+      addons: addons.map((item) => ({
+        unitPrice: item.unitAddonPrice,
+        quantity: addonQty[item.id] || 0,
+      })),
+      taxRate: branding.taxRate ?? 5,
+      defaultSecurityDeposit: branding.defaultSecurityDeposit ?? 150000,
+    });
   }, [addons, addonQty, branding.defaultSecurityDeposit, branding.taxRate, eventDate, guestCount, selectedHall, selectedMenu, startHour]);
 
   const adjustAddon = (id: string, delta: number, maxQty: number) => {
@@ -489,7 +481,7 @@ export default function TenantVenueStorefrontPage() {
         </section>
 
         {/* Halls Showcase */}
-        <section id="halls" className="mx-auto max-w-[1280px] px-6 py-16">
+        <section id="halls" className="mx-auto max-w-[1280px] scroll-mt-20 px-6 py-16">
           <div className="flex flex-wrap items-end justify-between gap-4">
             <div className="space-y-1.5">
               <p className="text-xs font-medium text-amber-700 dark:text-[#D4AF37]">
@@ -603,7 +595,7 @@ export default function TenantVenueStorefrontPage() {
         {/* Catering Menus & Add-On Equipment */}
         <section
           id="catering"
-          className="border-y border-slate-200 bg-white py-16 dark:border-slate-800 dark:bg-[#0B1120]"
+          className="scroll-mt-20 border-y border-slate-200 bg-white py-16 dark:border-slate-800 dark:bg-[#0B1120]"
         >
           <div className="mx-auto max-w-[1280px] space-y-10 px-6">
             <div>
@@ -662,7 +654,7 @@ export default function TenantVenueStorefrontPage() {
                               {fmtMoney(menu.pricePerGuest, currency, locale)}
                             </div>
                             <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                              {isRtl ? `/ ضيف (أدنى ${menu.minGuests})` : `/ guest (min ${menu.minGuests})`}
+                              {isRtl ? '/ ضيف' : '/ guest'}
                             </div>
                           </div>
                         </div>
@@ -681,11 +673,12 @@ export default function TenantVenueStorefrontPage() {
                 <div className="divide-y divide-slate-200 overflow-hidden rounded-xl border border-slate-200 bg-slate-50/60 dark:divide-slate-800 dark:border-slate-800 dark:bg-slate-900/60">
                   {addons.map((item) => {
                     const qty = addonQty[item.id] || 0;
+                    const itemLabel = isRtl ? item.nameAr : item.nameEn;
                     return (
                       <div key={item.id} className="flex items-center justify-between gap-4 px-4 py-3.5">
                         <div className="min-w-0">
                           <div className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
-                            {isRtl ? item.nameAr : item.nameEn}
+                            {itemLabel}
                           </div>
                           <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
                             <span className="font-mono tabular-nums">{fmtMoney(item.unitAddonPrice, currency, locale)}</span>
@@ -693,7 +686,7 @@ export default function TenantVenueStorefrontPage() {
                             <span>{item.category}</span>
                             <span aria-hidden="true" className="mx-1.5">·</span>
                             <span className="font-mono tabular-nums">
-                              {isRtl ? `متاح ${item.totalQuantity}` : `${item.totalQuantity} avail`}
+                              {isRtl ? `متاح ${item.totalStock}` : `${item.totalStock} avail`}
                             </span>
                           </div>
                         </div>
@@ -701,9 +694,9 @@ export default function TenantVenueStorefrontPage() {
                         <div className="flex shrink-0 items-center gap-2">
                           <button
                             type="button"
-                            onClick={() => adjustAddon(item.id, -1, item.totalQuantity)}
+                            onClick={() => adjustAddon(item.id, -1, item.totalStock)}
                             disabled={qty <= 0}
-                            aria-label={isRtl ? 'إنقاص الكمية' : 'Decrease quantity'}
+                            aria-label={isRtl ? `إنقاص ${itemLabel}` : `Decrease ${itemLabel}`}
                             className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-300 bg-white text-slate-700 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200"
                           >
                             <Minus className="h-3.5 w-3.5" />
@@ -713,9 +706,9 @@ export default function TenantVenueStorefrontPage() {
                           </span>
                           <button
                             type="button"
-                            onClick={() => adjustAddon(item.id, 1, item.totalQuantity)}
-                            disabled={qty >= item.totalQuantity}
-                            aria-label={isRtl ? 'زيادة الكمية' : 'Increase quantity'}
+                            onClick={() => adjustAddon(item.id, 1, item.totalStock)}
+                            disabled={qty >= item.totalStock}
+                            aria-label={isRtl ? `زيادة ${itemLabel}` : `Increase ${itemLabel}`}
                             className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-300 bg-white text-slate-700 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200"
                           >
                             <Plus className="h-3.5 w-3.5" />
@@ -731,7 +724,7 @@ export default function TenantVenueStorefrontPage() {
         </section>
 
         {/* Accepted Payment Channels Directory */}
-        <section id="payments" className="mx-auto max-w-[1280px] px-6 py-14">
+        <section id="payments" className="mx-auto max-w-[1280px] scroll-mt-20 px-6 py-14">
           <div className="space-y-1.5">
             <p className="text-xs font-medium text-amber-700 dark:text-[#D4AF37]">
               {isRtl ? 'وسائل الدفع والاسترداد المعتمدة' : 'Verified Payment & Refund Channels'}
@@ -742,37 +735,51 @@ export default function TenantVenueStorefrontPage() {
           </div>
 
           <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {paymentMethods.map((pm) => (
-              <div
-                key={pm.id}
-                className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900/70"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                    {isRtl ? pm.nameAr : pm.nameEn}
+            {paymentMethods.map((pm) => {
+              const copied = copiedMethodId === pm.id;
+              return (
+                <div
+                  key={pm.id}
+                  className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900/70"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                      {isRtl ? pm.nameAr : pm.nameEn}
+                    </div>
+                    <span className="font-mono text-[11px] text-slate-500 dark:text-slate-400">
+                      {pm.providerType}
+                    </span>
                   </div>
-                  <span className="font-mono text-[11px] text-slate-500 dark:text-slate-400">
-                    {pm.providerType}
-                  </span>
+                  <div className="mt-2 flex items-center justify-between gap-2">
+                    <div className="font-mono text-sm font-semibold tabular-nums text-amber-700 dark:text-[#D4AF37]" dir="ltr">
+                      {pm.accountNumber}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyAccount(pm.id, pm.accountNumber)}
+                      aria-label={isRtl ? `نسخ حساب ${pm.nameAr}` : `Copy ${pm.nameEn} account`}
+                      className="inline-flex min-h-[28px] items-center gap-1 rounded-md border border-slate-200 px-2 text-[11px] font-medium text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                    >
+                      {copied ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
+                      <span>{copied ? (isRtl ? 'تم النسخ' : 'Copied') : isRtl ? 'نسخ' : 'Copy'}</span>
+                    </button>
+                  </div>
+                  <div className="mt-1 text-xs text-slate-600 dark:text-slate-300">{pm.accountName}</div>
+                  {(isRtl ? pm.instructionsAr : pm.instructionsEn) && (
+                    <p className="mt-2 border-t border-slate-200 pt-2 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
+                      {isRtl ? pm.instructionsAr : pm.instructionsEn}
+                    </p>
+                  )}
                 </div>
-                <div className="mt-2 font-mono text-sm font-semibold tabular-nums text-amber-700 dark:text-[#D4AF37]" dir="ltr">
-                  {pm.accountNumber}
-                </div>
-                <div className="mt-1 text-xs text-slate-600 dark:text-slate-300">{pm.accountName}</div>
-                {(isRtl ? pm.instructionsAr : pm.instructionsEn) && (
-                  <p className="mt-2 border-t border-slate-200 pt-2 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
-                    {isRtl ? pm.instructionsAr : pm.instructionsEn}
-                  </p>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </section>
 
         {/* Interactive Booking, Live Quote & Client Portal Registration */}
         <section
           id="book-and-register"
-          className="border-t border-slate-200 bg-white py-16 dark:border-slate-800 dark:bg-[#0B1120]"
+          className="scroll-mt-20 border-t border-slate-200 bg-white py-16 dark:border-slate-800 dark:bg-[#0B1120]"
         >
           <div className="mx-auto max-w-[1280px] px-6">
             <div className="max-w-2xl space-y-2">
