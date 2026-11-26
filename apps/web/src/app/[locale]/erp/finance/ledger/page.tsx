@@ -2,12 +2,12 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
-import { Download, Plus, Upload } from 'lucide-react';
-import { apiFetch, downloadAuthorizedFile } from '@/lib/api';
+import { CheckCircle2, Download, ExternalLink, Plus, Receipt, Upload } from 'lucide-react';
 import { AppHeader } from '@/components/layout/AppHeader';
 import { MobileBottomNav } from '@/components/layout/MobileBottomNav';
-import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
 import { ResponsiveDataList } from '@/components/ui/ResponsiveDataList';
+import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
+import { apiFetch, downloadAuthorizedFile, getApiOrigin } from '@/lib/api';
 
 interface AccountRow {
   id: string;
@@ -33,15 +33,45 @@ interface JournalEntryRow {
   total_credit: number;
 }
 
+interface InvoiceMilestoneRow {
+  id: string;
+  title: string;
+  amount_due: number;
+  due_date: string;
+  paid_amount: number;
+  payment_method: string | null;
+  receipt_url: string | null;
+  status: string;
+}
+
+interface InvoiceRow {
+  id: string;
+  invoice_number: string;
+  event_id: string;
+  event_code: string;
+  client_name: string;
+  total_amount: number;
+  paid_amount: number;
+  security_deposit_amount: number;
+  deposit_status: string;
+  status: string;
+  milestones: InvoiceMilestoneRow[];
+}
+
 export default function GeneralLedgerPage() {
-  const params = useParams<{ locale: string }>();
-  const locale = params?.locale === 'en' ? 'en' : 'ar';
+  const params = useParams<{ locale?: string }>();
+  const locale: 'ar' | 'en' = params?.locale === 'en' ? 'en' : 'ar';
   const isRtl = locale === 'ar';
 
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [tbRows, setTbRows] = useState<TrialBalanceRow[]>([]);
   const [tbBalanced, setTbBalanced] = useState(true);
   const [entries, setEntries] = useState<JournalEntryRow[]>([]);
+  const [invoices, setInvoices] = useState<InvoiceRow[]>([]);
+
+  const [verifyMethods, setVerifyMethods] = useState<Record<string, string>>({});
+  const [verifyDeposits, setVerifyDeposits] = useState<Record<string, boolean>>({});
+  const [verifyRefs, setVerifyRefs] = useState<Record<string, string>>({});
 
   const [refCode, setRefCode] = useState('');
   const [desc, setDesc] = useState('');
@@ -57,15 +87,17 @@ export default function GeneralLedgerPage() {
 
   const load = useCallback(async () => {
     try {
-      const [accs, tb, jes] = await Promise.all([
+      const [accs, tb, jes, invs] = await Promise.all([
         apiFetch<AccountRow[]>('/api/v1/finance/accounts'),
         apiFetch<{ rows: TrialBalanceRow[]; is_balanced: boolean }>('/api/v1/finance/trial-balance'),
         apiFetch<JournalEntryRow[]>('/api/v1/finance/journal-entries'),
+        apiFetch<InvoiceRow[]>('/api/v1/finance/invoices'),
       ]);
       setAccounts(accs);
       setTbRows(tb.rows);
       setTbBalanced(tb.is_balanced);
       setEntries(jes);
+      setInvoices(invs);
       if (accs[0] && !debitAcc) setDebitAcc(accs[0].id);
       if (accs[1] && !creditAcc) setCreditAcc(accs[1].id);
     } catch (err) {
@@ -79,6 +111,33 @@ export default function GeneralLedgerPage() {
 
   const numericAmount = Number(amount) || 0;
   const canPost = numericAmount > 0 && debitAcc && creditAcc && debitAcc !== creditAcc;
+
+  const verifyMilestone = async (milestoneId: string) => {
+    try {
+      const method = verifyMethods[milestoneId] || 'KURAIMI_BANK';
+      const isDeposit = Boolean(verifyDeposits[milestoneId]);
+      const reference = verifyRefs[milestoneId] || 'Verified Transfer';
+      const res = await apiFetch<{ status: string; invoice_status: string; journal_entry_number: string }>(
+        `/api/v1/erp/finance/milestones/${milestoneId}/verify`,
+        {
+          method: 'PATCH',
+          body: {
+            payment_method: method,
+            is_security_deposit: isDeposit,
+            reference,
+          },
+        }
+      );
+      setNotice(
+        isRtl
+          ? `تم اعتماد الدفعة وترحيل القيد المزدوج ${res.journal_entry_number} (حالة الفاتورة: ${res.invoice_status})`
+          : `Verified receipt & posted Journal ${res.journal_entry_number} (Invoice: ${res.invoice_status})`
+      );
+      await load();
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : 'Verification failed');
+    }
+  };
 
   const postEntry = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -127,12 +186,24 @@ export default function GeneralLedgerPage() {
     await load();
   };
 
+  const pendingMilestones = invoices.flatMap((inv) =>
+    inv.milestones
+      .filter((m) => m.status !== 'PAID')
+      .map((m) => ({
+        ...m,
+        invoice_number: inv.invoice_number,
+        event_code: inv.event_code,
+        client_name: inv.client_name,
+      }))
+  );
+
   return (
-    <div className="min-h-screen bg-slate-50 pb-24 dark:bg-slate-950 md:pb-12">
+    <div dir={isRtl ? 'rtl' : 'ltr'} className="min-h-screen bg-slate-50 pb-24 dark:bg-slate-950 md:pb-12">
       <AppHeader locale={locale} />
-      <main className="mx-auto max-w-7xl space-y-6 px-4 py-6">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <SpotlightHeading as="h1" className="text-2xl">
+
+      <main className="mx-auto max-w-7xl space-y-6 px-4 py-6 sm:px-6">
+        <div className="flex flex-wrap items-center justify-between gap-3 text-start">
+          <SpotlightHeading as="h1" className="text-start text-2xl">
             {isRtl ? 'دفتر الأستاذ وميزان المراجعة المزدوج' : 'Double-Entry Ledger & Trial Balance'}
           </SpotlightHeading>
           <div className="flex flex-wrap gap-2">
@@ -156,54 +227,186 @@ export default function GeneralLedgerPage() {
         </div>
 
         {notice && (
-          <SpotlightCard className="border-emerald-500/40 bg-emerald-500/10 py-3 text-xs text-emerald-400">
+          <SpotlightCard className="border-emerald-500/40 bg-emerald-500/10 py-3 text-start text-xs text-emerald-600 dark:text-emerald-300">
             {notice}
           </SpotlightCard>
         )}
 
+        {/* Milestone Receipt Verification Queue */}
+        <SpotlightCard className="space-y-4 text-start">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <SpotlightHeading as="h2" className="flex items-center gap-2 text-start text-lg">
+              <Receipt className="h-5 w-5 text-[var(--brand-primary,#D4AF37)]" />
+              <span>{isRtl ? 'طابور التحقق من إيصالات الدفع والترحيل التلقائي' : 'Milestone Receipt Verification Queue'}</span>
+            </SpotlightHeading>
+            <span className="rounded-full bg-amber-500/15 px-3 py-1 font-mono text-xs font-bold text-amber-500">
+              {pendingMilestones.length} {isRtl ? 'دفعة معلقة' : 'Pending'}
+            </span>
+          </div>
+
+          {pendingMilestones.length === 0 ? (
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              {isRtl ? 'تم التحقق من جميع الدفعات المجدولة.' : 'All scheduled payment milestones are verified.'}
+            </p>
+          ) : (
+            <div className="space-y-3">
+              {pendingMilestones.map((m) => (
+                <div
+                  key={m.id}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-800 dark:bg-slate-950"
+                >
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2 font-bold">
+                      <span className="font-mono text-amber-500">{m.event_code}</span>
+                      <span>{m.client_name}</span>
+                      <span className="rounded bg-slate-200 px-2 py-0.5 font-mono text-[10px] dark:bg-slate-800">
+                        {m.status}
+                      </span>
+                    </div>
+                    <div className="text-slate-600 dark:text-slate-400">
+                      {m.invoice_number} — {m.title} ·{' '}
+                      <strong className="font-mono text-slate-900 dark:text-slate-100">
+                        {Number(m.amount_due).toLocaleString()}
+                      </strong>
+                    </div>
+                    {m.receipt_url && (
+                      <a
+                        href={`${getApiOrigin()}${m.receipt_url}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 font-semibold text-sky-500 underline"
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" />
+                        <span>{isRtl ? 'معاينة الإيصال المرفوع' : 'View Uploaded Receipt'}</span>
+                      </a>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      value={verifyMethods[m.id] || 'KURAIMI_BANK'}
+                      onChange={(e) => setVerifyMethods((prev) => ({ ...prev, [m.id]: e.target.value }))}
+                      className="min-h-[38px] rounded-lg border border-slate-300 bg-white px-2 text-xs dark:border-slate-700 dark:bg-slate-900"
+                    >
+                      <option value="KURAIMI_BANK">KURAIMI_BANK</option>
+                      <option value="JAIB_WALLET">JAIB_WALLET</option>
+                      <option value="JAWALI_WALLET">JAWALI_WALLET</option>
+                      <option value="ONECASH_WALLET">ONECASH_WALLET</option>
+                      <option value="CASH">CASH</option>
+                    </select>
+
+                    <input
+                      value={verifyRefs[m.id] ?? ''}
+                      onChange={(e) => setVerifyRefs((prev) => ({ ...prev, [m.id]: e.target.value }))}
+                      placeholder={isRtl ? 'رقم المرجع' : 'Ref #'}
+                      className="min-h-[38px] w-28 rounded-lg border border-slate-300 bg-white px-2 text-xs dark:border-slate-700 dark:bg-slate-900"
+                    />
+
+                    <label className="flex items-center gap-1.5 rounded-lg border border-slate-300 px-2.5 py-2 dark:border-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(verifyDeposits[m.id])}
+                        onChange={(e) => setVerifyDeposits((prev) => ({ ...prev, [m.id]: e.target.checked }))}
+                      />
+                      <span>{isRtl ? 'تأمين 2100' : '2100 Deposit'}</span>
+                    </label>
+
+                    <button
+                      type="button"
+                      onClick={() => verifyMilestone(m.id)}
+                      className="flex min-h-[38px] items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 font-bold text-white"
+                    >
+                      <CheckCircle2 className="h-4 w-4" />
+                      <span>{isRtl ? 'اعتماد وترحيل القيد' : 'Verify & Post Journal'}</span>
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </SpotlightCard>
+
         <div className="grid gap-6 lg:grid-cols-2">
           {/* Post Balanced Entry */}
-          <SpotlightCard>
+          <SpotlightCard className="text-start">
             <form onSubmit={postEntry} className="space-y-3">
-              <SpotlightHeading as="h2" className="text-lg">
+              <SpotlightHeading as="h2" className="text-start text-lg">
                 <Plus className="me-1.5 inline h-4 w-4" />
                 {isRtl ? 'قيد يومية مزدوج جديد' : 'Post Balanced Journal Entry'}
               </SpotlightHeading>
               <div className="grid gap-3 sm:grid-cols-2">
-                <input value={refCode} onChange={(e) => setRefCode(e.target.value)} placeholder={isRtl ? 'المرجع' : 'Reference'} className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-950" />
-                <input type="number" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder={isRtl ? 'المبلغ' : 'Amount'} className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-sm font-mono dark:border-slate-700 dark:bg-slate-950" />
-                <select value={debitAcc} onChange={(e) => setDebitAcc(e.target.value)} className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-xs dark:border-slate-700 dark:bg-slate-950">
+                <input
+                  value={refCode}
+                  onChange={(e) => setRefCode(e.target.value)}
+                  placeholder={isRtl ? 'المرجع' : 'Reference'}
+                  className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-950"
+                />
+                <input
+                  type="number"
+                  step="0.01"
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                  placeholder={isRtl ? 'المبلغ' : 'Amount'}
+                  className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 font-mono text-sm dark:border-slate-700 dark:bg-slate-950"
+                />
+                <select
+                  value={debitAcc}
+                  onChange={(e) => setDebitAcc(e.target.value)}
+                  className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-xs dark:border-slate-700 dark:bg-slate-950"
+                >
                   {accounts.map((a) => (
                     <option key={a.id} value={a.id}>{`${a.code} — ${isRtl ? a.name_ar : a.name_en} (Dr)`}</option>
                   ))}
                 </select>
-                <select value={creditAcc} onChange={(e) => setCreditAcc(e.target.value)} className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-xs dark:border-slate-700 dark:bg-slate-950">
+                <select
+                  value={creditAcc}
+                  onChange={(e) => setCreditAcc(e.target.value)}
+                  className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-xs dark:border-slate-700 dark:bg-slate-950"
+                >
                   {accounts.map((a) => (
                     <option key={a.id} value={a.id}>{`${a.code} — ${isRtl ? a.name_ar : a.name_en} (Cr)`}</option>
                   ))}
                 </select>
-                <input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder={isRtl ? 'البيان' : 'Description'} className="min-h-[44px] sm:col-span-2 rounded-lg border border-slate-300 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-950" />
+                <input
+                  value={desc}
+                  onChange={(e) => setDesc(e.target.value)}
+                  placeholder={isRtl ? 'البيان' : 'Description'}
+                  className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-950 sm:col-span-2"
+                />
               </div>
-              <button type="submit" disabled={!canPost} className="min-h-[44px] w-full rounded-lg bg-[var(--brand-primary,#D4AF37)] text-xs font-bold text-slate-950 disabled:opacity-40">
+              <button
+                type="submit"
+                disabled={!canPost}
+                className="min-h-[44px] w-full rounded-lg bg-[var(--brand-primary,#D4AF37)] text-xs font-bold text-slate-950 disabled:opacity-40"
+              >
                 {isRtl ? 'ترحيل القيد (مدين = دائن)' : 'Post Balanced Entry'}
               </button>
             </form>
           </SpotlightCard>
 
           {/* UTF-8 BOM CSV Bulk Importer */}
-          <SpotlightCard className="space-y-3">
-            <SpotlightHeading as="h2" className="text-lg">
+          <SpotlightCard className="space-y-3 text-start">
+            <SpotlightHeading as="h2" className="text-start text-lg">
               <Upload className="me-1.5 inline h-4 w-4" />
               {isRtl ? 'استيراد جماعي CSV (UTF-8 BOM)' : 'UTF-8 BOM CSV Bulk Importer'}
             </SpotlightHeading>
             <div className="grid gap-3 sm:grid-cols-2">
-              <select value={importEntity} onChange={(e) => setImportEntity(e.target.value as 'accounts' | 'inventory' | 'guests')} className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-950">
+              <select
+                value={importEntity}
+                onChange={(e) => setImportEntity(e.target.value as 'accounts' | 'inventory' | 'guests')}
+                className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-950"
+              >
                 <option value="accounts">{isRtl ? 'دليل الحسابات' : 'Chart of Accounts'}</option>
                 <option value="inventory">{isRtl ? 'المخزون والتجهيزات' : 'Inventory Items'}</option>
                 <option value="guests">{isRtl ? 'قائمة الضيوف وتصاريح QR' : 'Guest List & QR Passes'}</option>
               </select>
               {importEntity === 'guests' && (
-                <input value={importEventId} onChange={(e) => setImportEventId(e.target.value)} placeholder="Event UUID" className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-xs font-mono dark:border-slate-700 dark:bg-slate-950" />
+                <input
+                  value={importEventId}
+                  onChange={(e) => setImportEventId(e.target.value)}
+                  placeholder="Event UUID"
+                  className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
+                />
               )}
               <input
                 type="file"
@@ -212,27 +415,36 @@ export default function GeneralLedgerPage() {
                   const f = e.target.files?.[0];
                   if (f) handleFileSelect(f);
                 }}
-                className="sm:col-span-2 text-xs"
+                className="text-xs sm:col-span-2"
               />
             </div>
             {importPreview.length > 0 && (
-              <pre className="overflow-x-auto rounded-lg bg-slate-900 p-2.5 font-mono text-[11px] text-slate-200">
+              <pre dir="ltr" className="overflow-x-auto rounded-lg bg-slate-900 p-2.5 font-mono text-[11px] text-slate-200">
                 {importPreview.join('\n')}
               </pre>
             )}
-            <button type="button" disabled={!importFile} onClick={runCsvImport} className="min-h-[44px] w-full rounded-lg border border-[var(--brand-primary,#D4AF37)] text-xs font-bold text-[var(--brand-primary,#D4AF37)] disabled:opacity-40">
+            <button
+              type="button"
+              disabled={!importFile}
+              onClick={runCsvImport}
+              className="min-h-[44px] w-full rounded-lg border border-[var(--brand-primary,#D4AF37)] text-xs font-bold text-[var(--brand-primary,#D4AF37)] disabled:opacity-40"
+            >
               {isRtl ? 'تنفيذ الاستيراد' : 'Run CSV Import'}
             </button>
           </SpotlightCard>
         </div>
 
         {/* Trial Balance */}
-        <SpotlightCard className="space-y-3">
+        <SpotlightCard className="space-y-3 text-start">
           <div className="flex items-center justify-between">
-            <SpotlightHeading as="h2" className="text-lg">
+            <SpotlightHeading as="h2" className="text-start text-lg">
               {isRtl ? 'ميزان المراجعة' : 'Trial Balance'}
             </SpotlightHeading>
-            <span className={`rounded-full px-3 py-1 text-xs font-bold ${tbBalanced ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}`}>
+            <span
+              className={`rounded-full px-3 py-1 text-xs font-bold ${
+                tbBalanced ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'
+              }`}
+            >
               {tbBalanced ? (isRtl ? 'متوازن ✓' : 'Balanced ✓') : isRtl ? 'غير متوازن!' : 'Unbalanced!'}
             </span>
           </div>
@@ -251,8 +463,8 @@ export default function GeneralLedgerPage() {
         </SpotlightCard>
 
         {/* Journal Entries */}
-        <SpotlightCard className="space-y-3">
-          <SpotlightHeading as="h2" className="text-lg">
+        <SpotlightCard className="space-y-3 text-start">
+          <SpotlightHeading as="h2" className="text-start text-lg">
             {isRtl ? 'سجل قيود اليومية' : 'Posted Journal Entries'}
           </SpotlightHeading>
           <ResponsiveDataList

@@ -1,0 +1,160 @@
+import uuid
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.core.security import AuthContext, require_roles
+from app.models.accounting import Invoice
+from app.models.events import Event
+from app.models.tenant import SubscriptionStatus, SubscriptionTier, Tenant, TenantBranding
+from app.models.users import User, UserType
+from app.models.venue import CateringMenuItem, Hall
+
+router = APIRouter(prefix="/api/v1", tags=["Tier 1: SaaS Super-Admin & Tenant Directory"])
+
+
+class UpdateTenantAdminBody(BaseModel):
+    is_active: Optional[bool] = None
+    subscription_tier: Optional[SubscriptionTier] = None
+    subscription_status: Optional[SubscriptionStatus] = None
+    custom_domain: Optional[str] = None
+    custom_domain_verified: Optional[bool] = None
+    max_halls: Optional[int] = None
+    monthly_whatsapp_quota: Optional[int] = None
+    whatsapp_used_this_month: Optional[int] = None
+
+
+@router.get("/public/tenants/{slug}")
+async def get_public_tenant_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
+    clean_slug = slug.strip().lower()
+    tenant = (
+        await db.execute(select(Tenant).where(Tenant.slug == clean_slug, Tenant.is_active == True))  # noqa: E712
+    ).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Venue workspace not found or inactive")
+
+    branding = (
+        await db.execute(select(TenantBranding).where(TenantBranding.tenant_id == tenant.id))
+    ).scalar_one_or_none()
+    halls = (await db.execute(select(Hall).where(Hall.tenant_id == tenant.id))).scalars().all()
+    catering_items = (
+        await db.execute(select(CateringMenuItem).where(CateringMenuItem.tenant_id == tenant.id))
+    ).scalars().all()
+
+    return {
+        "id": str(tenant.id),
+        "name": tenant.name,
+        "slug": tenant.slug,
+        "custom_domain": tenant.custom_domain,
+        "custom_domain_verified": tenant.custom_domain_verified,
+        "currency": tenant.currency,
+        "tax_rate": float(tenant.tax_rate),
+        "subscription_tier": tenant.subscription_tier.value,
+        "subscription_status": tenant.subscription_status.value,
+        "payment_accounts": tenant.payment_accounts
+        or [
+            {"code": "KURAIMI_BANK", "labelAr": "بنك الكريمي", "labelEn": "Kuraimi Bank", "account": "301234567"},
+            {"code": "JAIB_WALLET", "labelAr": "محفظة جيب", "labelEn": "Jaib Wallet", "account": "770000001"},
+            {"code": "JAWALI_WALLET", "labelAr": "محفظة جوالي", "labelEn": "Jawali Wallet", "account": "770000002"},
+            {"code": "ONECASH_WALLET", "labelAr": "ون كاش", "labelEn": "OneCash", "account": "770000003"},
+        ],
+        "branding": {
+            "primaryColor": branding.primary_color if branding else "#D4AF37",
+            "accentColor": branding.accent_color if branding else "#0F172A",
+            "defaultTheme": branding.default_theme if branding else "DARK",
+            "enableSpotlight": branding.enable_spotlight if branding else True,
+            "spotlightColor": branding.spotlight_color if branding else "rgba(212, 175, 55, 0.18)",
+            "logoLightUrl": branding.logo_light_url if branding else None,
+            "logoDarkUrl": branding.logo_dark_url if branding else None,
+            "faviconUrl": branding.favicon_url if branding else None,
+            "heroTaglineAr": branding.hero_tagline_ar if branding else None,
+            "heroTaglineEn": branding.hero_tagline_en if branding else None,
+        },
+        "halls": [
+            {
+                "id": str(h.id),
+                "name": h.name,
+                "name_ar": h.name_ar,
+                "capacity_banquet": h.capacity_banquet,
+                "capacity_theater": h.capacity_theater,
+                "base_price": float(h.base_price),
+                "cleaning_buffer_minutes": h.cleaning_buffer_minutes,
+                "combinable_with_hall_id": str(h.combinable_with_hall_id) if h.combinable_with_hall_id else None,
+            }
+            for h in halls
+        ],
+        "catering_items": [
+            {
+                "id": str(c.id),
+                "name_ar": c.name_ar,
+                "name_en": c.name_en,
+                "price_per_guest": float(c.price_per_guest),
+            }
+            for c in catering_items
+        ],
+    }
+
+
+@router.get("/admin/tenants")
+async def list_all_tenants(
+    auth: AuthContext = Depends(require_roles({UserType.SUPER_ADMIN})),
+    db: AsyncSession = Depends(get_db),
+):
+    tenants = (await db.execute(select(Tenant).order_by(Tenant.created_at.desc()))).scalars().all()
+    items = []
+    for t in tenants:
+        halls_count = (await db.execute(select(func.count(Hall.id)).where(Hall.tenant_id == t.id))).scalar() or 0
+        events_count = (await db.execute(select(func.count(Event.id)).where(Event.tenant_id == t.id))).scalar() or 0
+        users_count = (await db.execute(select(func.count(User.id)).where(User.tenant_id == t.id))).scalar() or 0
+        gmv = (
+            await db.execute(select(func.coalesce(func.sum(Invoice.total_amount), 0)).where(Invoice.tenant_id == t.id))
+        ).scalar() or 0
+        items.append(
+            {
+                "id": str(t.id),
+                "name": t.name,
+                "slug": t.slug,
+                "custom_domain": t.custom_domain,
+                "custom_domain_verified": t.custom_domain_verified,
+                "subscription_tier": t.subscription_tier.value,
+                "subscription_status": t.subscription_status.value,
+                "max_halls": t.max_halls,
+                "monthly_whatsapp_quota": t.monthly_whatsapp_quota,
+                "whatsapp_used_this_month": t.whatsapp_used_this_month,
+                "currency": t.currency,
+                "is_active": t.is_active,
+                "halls_count": halls_count,
+                "events_count": events_count,
+                "users_count": users_count,
+                "total_gmv": float(gmv),
+                "created_at": t.created_at.isoformat(),
+            }
+        )
+    return {"tenants": items}
+
+
+@router.patch("/admin/tenants/{tenant_id}")
+async def update_tenant_admin(
+    tenant_id: uuid.UUID,
+    body: UpdateTenantAdminBody,
+    auth: AuthContext = Depends(require_roles({UserType.SUPER_ADMIN})),
+    db: AsyncSession = Depends(get_db),
+):
+    tenant = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    updates = body.model_dump(exclude_none=True)
+    if "custom_domain" in updates:
+        updates["custom_domain"] = updates["custom_domain"].strip().lower() or None
+
+    for field, val in updates.items():
+        if hasattr(tenant, field):
+            setattr(tenant, field, val)
+
+    await db.commit()
+    return {"status": "UPDATED", "tenant_id": str(tenant.id), "is_active": tenant.is_active}

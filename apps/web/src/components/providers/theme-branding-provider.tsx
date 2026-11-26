@@ -1,6 +1,7 @@
 'use client';
 
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { usePathname } from 'next/navigation';
 import { ThemeProvider as NextThemesProvider } from 'next-themes';
 import { apiFetch } from '@/lib/api';
 import type { PublicTenant } from '@/lib/types';
@@ -50,6 +51,7 @@ export function useTenantBranding() {
 }
 
 export function ThemeBrandingProvider({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
   const [config, setConfig] = useState<TenantBrandingConfig>(DEFAULT_BRANDING);
 
   const refreshBranding = useCallback(async () => {
@@ -86,7 +88,7 @@ export function ThemeBrandingProvider({ children }: { children: React.ReactNode 
 
   useEffect(() => {
     refreshBranding();
-  }, [refreshBranding]);
+  }, [refreshBranding, pathname]);
 
   useEffect(() => {
     const root = document.documentElement;

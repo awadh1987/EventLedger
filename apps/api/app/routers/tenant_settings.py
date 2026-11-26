@@ -3,14 +3,13 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import AuthContext, get_current_auth, require_roles
-from app.models.events import Event
-from app.models.tenant import RecordLifecycle, SubscriptionTier, SystemLookup, Tenant, TenantBranding
-from app.models.users import StaffRole, User, UserType
+from app.models.tenant import RecordLifecycle, SystemLookup, TenantBranding
+from app.models.users import StaffRole, UserType
 from app.models.venue import Hall, InventoryItem, PricingRule
 
 router = APIRouter(prefix="/api/v1", tags=["Tenant Settings, Lookups, Venue & Super Admin"])
@@ -25,6 +24,8 @@ class UpdateBrandingBody(BaseModel):
     logo_light_url: Optional[str] = None
     logo_dark_url: Optional[str] = None
     favicon_url: Optional[str] = None
+    hero_tagline_ar: Optional[str] = None
+    hero_tagline_en: Optional[str] = None
     invoice_footer_ar: Optional[str] = None
     invoice_footer_en: Optional[str] = None
 
@@ -42,12 +43,6 @@ class PatchLookupBody(BaseModel):
     label_en: Optional[str] = None
     sort_order: Optional[int] = None
     lifecycle: Optional[RecordLifecycle] = None
-
-
-class PatchAdminTenantBody(BaseModel):
-    is_active: Optional[bool] = None
-    subscription_tier: Optional[SubscriptionTier] = None
-    custom_domain: Optional[str] = None
 
 
 @router.get("/tenant/branding")
@@ -74,6 +69,8 @@ async def get_tenant_branding(
         "logo_light_url": b.logo_light_url,
         "logo_dark_url": b.logo_dark_url,
         "favicon_url": b.favicon_url,
+        "hero_tagline_ar": b.hero_tagline_ar,
+        "hero_tagline_en": b.hero_tagline_en,
         "invoice_footer_ar": b.invoice_footer_ar,
         "invoice_footer_en": b.invoice_footer_en,
     }
@@ -227,45 +224,3 @@ async def list_pricing_rules(auth: AuthContext = Depends(get_current_auth), db: 
         }
         for r in rows
     ]
-
-
-@router.get("/admin/tenants")
-async def admin_list_tenants(
-    auth: AuthContext = Depends(require_roles({UserType.SUPER_ADMIN})),
-    db: AsyncSession = Depends(get_db),
-):
-    tenants = (await db.execute(select(Tenant).order_by(Tenant.created_at.desc()))).scalars().all()
-    out = []
-    for t in tenants:
-        u_cnt = (await db.execute(select(func.count(User.id)).where(User.tenant_id == t.id))).scalar() or 0
-        e_cnt = (await db.execute(select(func.count(Event.id)).where(Event.tenant_id == t.id))).scalar() or 0
-        out.append(
-            {
-                "id": str(t.id),
-                "name": t.name,
-                "slug": t.slug,
-                "custom_domain": t.custom_domain,
-                "subscription_tier": t.subscription_tier.value,
-                "is_active": t.is_active,
-                "created_at": t.created_at.isoformat(),
-                "users_count": u_cnt,
-                "events_count": e_cnt,
-            }
-        )
-    return out
-
-
-@router.patch("/admin/tenants/{tenant_id}")
-async def admin_patch_tenant(
-    tenant_id: uuid.UUID,
-    body: PatchAdminTenantBody,
-    auth: AuthContext = Depends(require_roles({UserType.SUPER_ADMIN})),
-    db: AsyncSession = Depends(get_db),
-):
-    t = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one_or_none()
-    if not t:
-        raise HTTPException(status_code=404, detail="Tenant not found")
-    for field, val in body.model_dump(exclude_none=True).items():
-        setattr(t, field, val)
-    await db.commit()
-    return {"status": "UPDATED"}

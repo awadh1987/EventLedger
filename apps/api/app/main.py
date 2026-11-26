@@ -8,11 +8,14 @@ from sqlalchemy import text
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.tenant_middleware import TenantResolverMiddleware
+import app.models.events_extensions  # noqa: F401
 from app.routers import (
+    admin,
     approvals,
     auth,
     bookings,
     finance,
+    lifecycle_ops,
     offline_sync,
     phase6_ops,
     portal,
@@ -39,11 +42,13 @@ os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
 
 app.include_router(public_onboarding.router)
+app.include_router(admin.router)
 app.include_router(auth.auth_router)
 app.include_router(portal.portal_router)
 app.include_router(bookings.router)
 app.include_router(approvals.router)
 app.include_router(finance.router)
+app.include_router(lifecycle_ops.router)
 app.include_router(phase6_ops.router)
 app.include_router(tenant_settings.router)
 app.include_router(offline_sync.router)

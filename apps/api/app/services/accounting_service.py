@@ -168,6 +168,59 @@ class DoubleEntryService:
         return {"status": "PAID", "journal_entry_id": str(entry.id)}
 
     @staticmethod
+    async def record_verified_payment(
+        db: AsyncSession,
+        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        event_id: uuid.UUID,
+        amount: Decimal,
+        is_security_deposit: bool = False,
+        payment_method: str = "KURAIMI_BANK",
+        reference: str = "Verified Transfer",
+    ) -> JournalEntry:
+        cfg = (
+            await db.execute(select(AccountingConfig).where(AccountingConfig.tenant_id == tenant_id))
+        ).scalar_one_or_none()
+        if not cfg:
+            raise HTTPException(status_code=400, detail="AccountingConfig missing for tenant")
+
+        debit_acc = cfg.cash_account_id if payment_method.upper() == "CASH" else cfg.bank_account_id
+        credit_acc = cfg.security_deposit_liab_id if is_security_deposit else cfg.accounts_receivable_id
+        if not debit_acc or not credit_acc:
+            raise HTTPException(status_code=400, detail="AccountingConfig accounts incomplete for tenant")
+
+        entry = await DoubleEntryService.post_balanced_entry(
+            db=db,
+            tenant_id=tenant_id,
+            created_by_id=user_id,
+            reference=reference,
+            description=f"Verified payment ({payment_method}) — {reference}",
+            event_id=event_id,
+            lines=[
+                {"account_id": debit_acc, "debit": amount, "credit": Decimal("0.00"), "memo": reference},
+                {"account_id": credit_acc, "debit": Decimal("0.00"), "credit": amount, "memo": reference},
+            ],
+        )
+
+        db.add(
+            AuditLog(
+                tenant_id=tenant_id,
+                event_id=event_id,
+                actor_id=user_id,
+                action="PAYMENT_VERIFIED",
+                new_value={
+                    "amount": float(amount),
+                    "is_security_deposit": is_security_deposit,
+                    "payment_method": payment_method,
+                    "journal_entry_id": str(entry.id),
+                },
+            )
+        )
+        await db.commit()
+        await db.refresh(entry)
+        return entry
+
+    @staticmethod
     async def get_trial_balance(db: AsyncSession, tenant_id: uuid.UUID) -> dict:
         accounts = (
             await db.execute(

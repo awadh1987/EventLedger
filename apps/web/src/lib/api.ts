@@ -1,5 +1,9 @@
 const TOKEN_KEY = 'el_access_token';
+const ALT_TOKEN_KEY = 'eventledger_token';
 const SLUG_KEY = 'el_tenant_slug';
+const ALT_SLUG_KEY = 'eventledger_tenant_slug';
+const USER_KEY = 'el_auth_user';
+const ALT_USER_KEY = 'eventledger_user';
 const NATIVE_WS_KEY = 'el_native_workspace';
 
 export class ApiError extends Error {
@@ -7,7 +11,13 @@ export class ApiError extends Error {
   detail: unknown;
 
   constructor(status: number, detail: unknown) {
-    super(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : detail && typeof detail === 'object' && 'message' in detail
+          ? String((detail as { message: unknown }).message)
+          : JSON.stringify(detail);
+    super(message);
     this.status = status;
     this.detail = detail;
   }
@@ -43,58 +53,108 @@ export function setNativeWorkspace(cfg: NativeWorkspaceConfig | null): void {
   if (!cfg) {
     localStorage.removeItem(NATIVE_WS_KEY);
     localStorage.removeItem(SLUG_KEY);
+    localStorage.removeItem(ALT_SLUG_KEY);
   } else {
     localStorage.setItem(NATIVE_WS_KEY, JSON.stringify(cfg));
     localStorage.setItem(SLUG_KEY, cfg.slug);
+    localStorage.setItem(ALT_SLUG_KEY, cfg.slug);
   }
 }
 
 export function getApiOrigin(): string {
   const native = getNativeWorkspace();
-  if (native?.apiOrigin) return native.apiOrigin.replace(/\/$/, '');
-  return (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/$/, '');
+  if (native?.apiOrigin) return native.apiOrigin.replace(/\/api\/v1\/?$/, '').replace(/\/+$/, '');
+  if (typeof window !== 'undefined') {
+    const custom = localStorage.getItem('eventledger_api_base_url');
+    if (custom) return custom.replace(/\/api\/v1\/?$/, '').replace(/\/+$/, '');
+  }
+  return (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000')
+    .replace(/\/api\/v1\/?$/, '')
+    .replace(/\/+$/, '');
+}
+
+export function getApiBaseUrl(): string {
+  return `${getApiOrigin()}/api/v1`;
 }
 
 export function getTenantSlug(): string | null {
-  if (typeof window === 'undefined') return process.env.NEXT_PUBLIC_DEFAULT_TENANT_SLUG || null;
+  if (typeof window === 'undefined') return process.env.NEXT_PUBLIC_DEFAULT_TENANT_SLUG || 'almassa';
+
+  const pathMatch = window.location.pathname.match(/^\/(?:(?:ar|en)\/)?t\/([a-z0-9-]+)/i);
+  if (pathMatch?.[1]) return pathMatch[1].toLowerCase();
+
   const native = getNativeWorkspace();
-  if (native?.slug) return native.slug;
+  if (native?.slug) return native.slug.toLowerCase();
 
   const host = window.location.hostname.toLowerCase();
   const rootDomain = (process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'eventledger.local:3000').split(':')[0].toLowerCase();
+  const rootDomains = Array.from(new Set([rootDomain, 'eventledger.local', 'eventledger.cloud']));
 
-  if (host.endsWith(`.${rootDomain}`)) {
-    const sub = host.replace(`.${rootDomain}`, '');
-    if (sub && sub !== 'www' && sub !== 'admin') return sub;
+  for (const domain of rootDomains) {
+    if (host.endsWith(`.${domain}`)) {
+      const sub = host.slice(0, -(domain.length + 1));
+      if (sub && sub !== 'www' && sub !== 'admin' && sub !== 'api') return sub;
+    }
   }
-  const stored = localStorage.getItem(SLUG_KEY);
-  if (stored) return stored;
 
-  if (host === 'localhost' || host === '127.0.0.1') {
-    return process.env.NEXT_PUBLIC_DEFAULT_TENANT_SLUG || 'almassa';
-  }
-  return null;
+  const stored = localStorage.getItem(SLUG_KEY) || localStorage.getItem(ALT_SLUG_KEY);
+  if (stored) return stored.toLowerCase();
+
+  return process.env.NEXT_PUBLIC_DEFAULT_TENANT_SLUG || 'almassa';
+}
+
+export function getActiveTenantSlug(): string {
+  return getTenantSlug() || 'almassa';
 }
 
 export function setTenantSlug(slug: string | null): void {
   if (typeof window === 'undefined') return;
-  if (slug) localStorage.setItem(SLUG_KEY, slug);
-  else localStorage.removeItem(SLUG_KEY);
+  if (slug) {
+    const clean = slug.trim().toLowerCase();
+    localStorage.setItem(SLUG_KEY, clean);
+    localStorage.setItem(ALT_SLUG_KEY, clean);
+  } else {
+    localStorage.removeItem(SLUG_KEY);
+    localStorage.removeItem(ALT_SLUG_KEY);
+  }
 }
 
 export function getAccessToken(): string | null {
   if (typeof window === 'undefined') return null;
-  return localStorage.getItem(TOKEN_KEY);
+  return localStorage.getItem(TOKEN_KEY) || localStorage.getItem(ALT_TOKEN_KEY);
 }
 
 export function setAccessToken(token: string | null): void {
   if (typeof window === 'undefined') return;
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else localStorage.removeItem(TOKEN_KEY);
+  if (token) {
+    localStorage.setItem(TOKEN_KEY, token);
+    localStorage.setItem(ALT_TOKEN_KEY, token);
+  } else {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(ALT_TOKEN_KEY);
+  }
+}
+
+export function clearAuthStorage(): void {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(ALT_TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+  localStorage.removeItem(ALT_USER_KEY);
+  localStorage.removeItem(SLUG_KEY);
+  localStorage.removeItem(ALT_SLUG_KEY);
 }
 
 export function isNativeBuild(): boolean {
   return process.env.NEXT_PUBLIC_BUILD_TARGET === 'NATIVE';
+}
+
+export function tenantPath(locale: string, slug: string | null | undefined, routePath: string): string {
+  const cleanRoute = routePath.startsWith('/') ? routePath : `/${routePath}`;
+  if (isNativeBuild() || !slug) {
+    return `/${locale}${cleanRoute}`;
+  }
+  return `/${locale}/t/${slug.toLowerCase()}${cleanRoute}`;
 }
 
 export function dynamicHref(locale: string, basePath: string, id: string): string {
@@ -104,44 +164,80 @@ export function dynamicHref(locale: string, basePath: string, id: string): strin
   return `/${locale}${basePath}/${encodeURIComponent(id)}`;
 }
 
-interface FetchOptions {
+export interface FetchOptions {
   method?: string;
   body?: unknown;
   formData?: FormData;
+  headers?: HeadersInit;
   slugOverride?: string;
   originOverride?: string;
   skipAuth?: boolean;
+  cache?: RequestCache;
+  signal?: AbortSignal;
 }
 
-export async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
-  const origin = (opts.originOverride || getApiOrigin()).replace(/\/$/, '');
-  const headers: Record<string, string> = {};
+export async function apiFetch<T = any>(
+  path: string,
+  opts: FetchOptions = {},
+  explicitSlug?: string
+): Promise<T> {
+  const origin = (opts.originOverride || getApiOrigin()).replace(/\/+$/, '');
 
-  const slug = opts.slugOverride ?? getTenantSlug();
-  if (slug) headers['X-Tenant-Slug'] = slug;
+  let url: string;
+  if (path.startsWith('http://') || path.startsWith('https://')) {
+    url = path;
+  } else {
+    const cleanPath = path.startsWith('/') ? path : `/${path}`;
+    if (
+      cleanPath.startsWith('/api/') ||
+      cleanPath === '/health' ||
+      cleanPath.startsWith('/health?') ||
+      cleanPath.startsWith('/uploads/')
+    ) {
+      url = `${origin}${cleanPath}`;
+    } else {
+      url = `${origin}/api/v1${cleanPath}`;
+    }
+  }
+
+  const headers = new Headers(opts.headers || {});
+
+  const slug = explicitSlug ?? opts.slugOverride ?? getTenantSlug();
+  if (slug && !headers.has('X-Tenant-Slug')) {
+    headers.set('X-Tenant-Slug', slug);
+  }
 
   const token = opts.skipAuth ? null : getAccessToken();
-  if (token) headers['Authorization'] = `Bearer ${token}`;
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
 
   let body: BodyInit | undefined;
   if (opts.formData) {
     body = opts.formData;
+  } else if (opts.body instanceof FormData) {
+    body = opts.body;
+  } else if (typeof opts.body === 'string') {
+    if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+    body = opts.body;
   } else if (opts.body !== undefined) {
-    headers['Content-Type'] = 'application/json';
+    if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
     body = JSON.stringify(opts.body);
   }
 
-  const res = await fetch(`${origin}${path}`, {
+  const res = await fetch(url, {
     method: opts.method || (body ? 'POST' : 'GET'),
     headers,
     body,
+    cache: opts.cache,
+    signal: opts.signal,
   });
 
   if (!res.ok) {
     let detail: unknown = res.statusText;
     try {
       const json = await res.json();
-      detail = json?.detail ?? json;
+      detail = json?.detail?.message || json?.detail || json;
     } catch {
       // ignore json parse failure
     }
@@ -158,7 +254,8 @@ export async function downloadAuthorizedFile(path: string, filename: string): Pr
   const token = getAccessToken();
   if (token) headers['Authorization'] = `Bearer ${token}`;
 
-  const res = await fetch(`${origin}${path}`, { headers });
+  const cleanPath = path.startsWith('/') ? path : `/${path}`;
+  const res = await fetch(`${origin}${cleanPath}`, { headers });
   if (!res.ok) throw new ApiError(res.status, 'Download failed');
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);

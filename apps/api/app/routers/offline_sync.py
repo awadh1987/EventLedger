@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -80,13 +80,14 @@ async def gate_check_in(
 
 @router.get("/sync/manifest")
 async def get_offline_manifest(
+    days_ahead: int = Query(default=60, ge=1, le=365),
     auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF})),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
     window_start = utcnow() - timedelta(hours=6)
-    window_end = utcnow() + timedelta(hours=48)
+    window_end = utcnow() + timedelta(days=days_ahead)
     events = (
         await db.execute(
             select(Event).where(
@@ -97,6 +98,7 @@ async def get_offline_manifest(
         )
     ).scalars().all()
     event_ids = [e.id for e in events]
+    ev_code_by_id = {e.id: e.event_code for e in events}
     passes = (
         (
             await db.execute(
@@ -116,7 +118,16 @@ async def get_offline_manifest(
             for e in events
         ],
         "gate_passes": [
-            {"id": str(p.id), "qr_token": p.qr_token, "holder_name": p.holder_name, "pass_type": p.pass_type, "is_checked_in": p.is_checked_in}
+            {
+                "id": str(p.id),
+                "event_id": str(p.event_id),
+                "event_code": ev_code_by_id.get(p.event_id, ""),
+                "qr_token": p.qr_token,
+                "holder_name": p.holder_name,
+                "pass_type": p.pass_type,
+                "is_checked_in": p.is_checked_in,
+                "checked_in_at": p.checked_in_at.isoformat() if p.checked_in_at else None,
+            }
             for p in passes
         ],
     }

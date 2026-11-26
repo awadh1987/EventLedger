@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from app.core.database import AsyncSessionLocal, engine
 from app.core.security import hash_password
-from app.models.accounting import DepositStatus, Invoice, InvoiceStatus, PaymentMilestone
+from app.models.accounting import AccountingConfig, DepositStatus, Invoice, InvoiceStatus, PaymentMilestone
 from app.models.base import Base, utcnow
 from app.models.events import (
     ApprovalRequest,
@@ -19,7 +19,14 @@ from app.models.events import (
     EventStatus,
     GatePass,
 )
-from app.models.tenant import SubscriptionTier, Tenant, TenantBranding
+from app.models.events_extensions import (  # noqa: F401
+    DamageInspection,
+    EventContract,
+    EventGuest,
+    InspectionStatus,
+    RsvpStatus,
+)
+from app.models.tenant import SubscriptionStatus, SubscriptionTier, Tenant, TenantBranding
 from app.models.users import (
     ClientCategory,
     ClientProfile,
@@ -32,6 +39,7 @@ from app.models.users import (
 )
 from app.models.venue import CateringMenuItem, Hall, InventoryItem, PricingRule
 from app.routers.public_onboarding import seed_tenant_defaults
+from app.services.accounting_service import DoubleEntryService
 
 
 async def seed_all() -> None:
@@ -65,9 +73,15 @@ async def seed_all() -> None:
         tenant = Tenant(
             name="قاعات الماسة الملكية (Al-Massa Royal Venues)",
             slug="almassa",
+            custom_domain="events.almassa.ye",
+            custom_domain_verified=True,
             currency="YER",
             tax_rate=Decimal("5.00"),
             subscription_tier=SubscriptionTier.ENTERPRISE,
+            subscription_status=SubscriptionStatus.ACTIVE,
+            max_halls=10,
+            monthly_whatsapp_quota=10000,
+            whatsapp_used_this_month=42,
             settings={
                 "cateringLockHours": 72,
                 "floorPlanLockHours": 24,
@@ -86,6 +100,8 @@ async def seed_all() -> None:
                 default_theme="SYSTEM",
                 enable_spotlight=True,
                 spotlight_color="rgba(212, 175, 55, 0.18)",
+                hero_tagline_ar="حيث تلتقي الفخامة الملكية بدقة التنظيم في كل مناسبة",
+                hero_tagline_en="Where royal elegance meets flawless event execution",
                 invoice_footer_ar="شكراً لاختياركم قاعات الماسة الملكية — تخضع جميع العقود للشروط والأحكام",
                 invoice_footer_en="Thank you for choosing Al-Massa Royal Venues.",
             )
@@ -304,16 +320,85 @@ async def seed_all() -> None:
             ]
         )
         db.add(
-            GatePass(
+            EventContract(
                 tenant_id=tenant.id,
                 event_id=ev.id,
-                pass_type="VIP_PASS",
-                holder_name="الشيخ عبدالله يحيى الشامي",
-                qr_token="QR-EVT-2026-1001-VIP01",
-                valid_from=start,
-                valid_until=start + timedelta(hours=6),
+                contract_number="CTR-EVT-2026-1001",
+                terms_ar="يلتزم الطرف الثاني بسداد دفعة التأكيد (50%) وتأمين الأضرار المسترد (150,000)، ويُسترد التأمين بعد فحص القاعة.",
+                terms_en="Second Party agrees to pay the 50% confirmation deposit and 150,000 refundable security deposit, released after post-event inspection.",
+                client_signed_at=utcnow(),
+                client_signature_name="أحمد عبدالله الشامي",
+                client_signature_ip="127.0.0.1",
+                staff_countersigned_at=utcnow(),
             )
         )
+
+        vip_pass = GatePass(
+            tenant_id=tenant.id,
+            event_id=ev.id,
+            pass_type="VIP_PASS",
+            holder_name="الشيخ عبدالله يحيى الشامي",
+            qr_token="QR-EVT-2026-1001-VIP01",
+            valid_from=start - timedelta(hours=2),
+            valid_until=start + timedelta(hours=8),
+        )
+        family_pass = GatePass(
+            tenant_id=tenant.id,
+            event_id=ev.id,
+            pass_type="VIP_PASS",
+            holder_name="د. نادية المتوكل",
+            qr_token="QR-EVT-2026-1001-FAM02",
+            valid_from=start - timedelta(hours=2),
+            valid_until=start + timedelta(hours=8),
+        )
+        guest_pass = GatePass(
+            tenant_id=tenant.id,
+            event_id=ev.id,
+            pass_type="GUEST_PASS",
+            holder_name="م. سامي الحكيمي",
+            qr_token="QR-EVT-2026-1001-GST03",
+            valid_from=start - timedelta(hours=2),
+            valid_until=start + timedelta(hours=8),
+        )
+        db.add_all([vip_pass, family_pass, guest_pass])
+        await db.flush()
+
+        db.add_all(
+            [
+                EventGuest(
+                    tenant_id=tenant.id,
+                    event_id=ev.id,
+                    full_name="الشيخ عبدالله يحيى الشامي",
+                    phone="+967771000101",
+                    vip_tier="VIP",
+                    table_label="VIP-T1",
+                    rsvp_status=RsvpStatus.CONFIRMED,
+                    gate_pass_id=vip_pass.id,
+                ),
+                EventGuest(
+                    tenant_id=tenant.id,
+                    event_id=ev.id,
+                    full_name="د. نادية المتوكل",
+                    phone="+967771000102",
+                    vip_tier="FAMILY",
+                    dietary_notes="بدون مكسرات / Nut-free",
+                    table_label="FAM-T2",
+                    rsvp_status=RsvpStatus.CONFIRMED,
+                    gate_pass_id=family_pass.id,
+                ),
+                EventGuest(
+                    tenant_id=tenant.id,
+                    event_id=ev.id,
+                    full_name="م. سامي الحكيمي",
+                    phone="+967771000103",
+                    vip_tier="STANDARD",
+                    table_label="TBL-05",
+                    rsvp_status=RsvpStatus.INVITED,
+                    gate_pass_id=guest_pass.id,
+                ),
+            ]
+        )
+
         db.add(
             AuditLog(
                 tenant_id=tenant.id,
@@ -324,6 +409,86 @@ async def seed_all() -> None:
             )
         )
         await db.commit()
+
+        cfg = (
+            await db.execute(select(AccountingConfig).where(AccountingConfig.tenant_id == tenant.id))
+        ).scalar_one()
+
+        await DoubleEntryService.post_balanced_entry(
+            db=db,
+            tenant_id=tenant.id,
+            created_by_id=finance_user.id,
+            reference="INV-2026-1001",
+            description="استحقاق فاتورة حجز قاعة الماسة الكبرى / Invoice accrual for EVT-2026-1001",
+            event_id=ev.id,
+            lines=[
+                {
+                    "account_id": cfg.accounts_receivable_id,
+                    "debit": Decimal("1575000.00"),
+                    "credit": Decimal("0.00"),
+                    "memo": "INV-2026-1001 Accounts Receivable",
+                },
+                {
+                    "account_id": cfg.hall_revenue_account_id,
+                    "debit": Decimal("0.00"),
+                    "credit": Decimal("1500000.00"),
+                    "memo": "Grand Diamond Hall Rental Revenue",
+                },
+                {
+                    "account_id": cfg.tax_payable_account_id,
+                    "debit": Decimal("0.00"),
+                    "credit": Decimal("75000.00"),
+                    "memo": "Tax Payable (5%)",
+                },
+            ],
+        )
+
+        await DoubleEntryService.post_balanced_entry(
+            db=db,
+            tenant_id=tenant.id,
+            created_by_id=finance_user.id,
+            reference="PAY-INV-2026-1001-M1",
+            description="تحصيل الدفعة الأولى (50%) عبر الكريمي / Verified 50% milestone via KURAIMI",
+            event_id=ev.id,
+            lines=[
+                {
+                    "account_id": cfg.bank_account_id,
+                    "debit": Decimal("787500.00"),
+                    "credit": Decimal("0.00"),
+                    "memo": "الدفعة الأولى (50%) - KURAIMI",
+                },
+                {
+                    "account_id": cfg.accounts_receivable_id,
+                    "debit": Decimal("0.00"),
+                    "credit": Decimal("787500.00"),
+                    "memo": "Settle 50% of INV-2026-1001",
+                },
+            ],
+        )
+
+        await DoubleEntryService.post_balanced_entry(
+            db=db,
+            tenant_id=tenant.id,
+            created_by_id=finance_user.id,
+            reference="DEP-INV-2026-1001",
+            description="تأمين الأضرار المسترد (التزامات 2100) / Refundable security deposit held in Liability 2100",
+            event_id=ev.id,
+            lines=[
+                {
+                    "account_id": cfg.bank_account_id,
+                    "debit": Decimal("150000.00"),
+                    "credit": Decimal("0.00"),
+                    "memo": "Security deposit received via KURAIMI",
+                },
+                {
+                    "account_id": cfg.security_deposit_liab_id,
+                    "debit": Decimal("0.00"),
+                    "credit": Decimal("150000.00"),
+                    "memo": "Liability 2100 Refundable Security Deposit",
+                },
+            ],
+        )
+
         print("Seed completed for tenant: almassa")
 
 
