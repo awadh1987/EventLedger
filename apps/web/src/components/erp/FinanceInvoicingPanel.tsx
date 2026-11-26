@@ -872,7 +872,19 @@ export function FinanceInvoicingPanel({
                 value={payReference}
                 onChange={(e) => setPayReference(e.target.value)}
                 placeholder="KRM-9920144"
-                className="mt-1 min-h-[40px] w-full rounded-lg border border-slate-200 bg-white px-3 font-mono text-xs dark:border-slate-800 dark:bg-slate-950"
+                className="mt-1 min-h-[44px] w-full rounded-lg border border-slate-200 bg-white px-3 font-mono text-xs dark:border-slate-800 dark:bg-slate-950"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-600 dark:text-slate-400">
+                {isRtl ? 'إرفاق صورة سند السداد (كاميرا الجوال)' : 'Capture Receipt Photo (Camera)'}
+              </label>
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                className="mt-1 min-h-[44px] w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs dark:border-slate-800 dark:bg-slate-950"
               />
             </div>
 

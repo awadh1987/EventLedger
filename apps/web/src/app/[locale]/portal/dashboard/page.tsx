@@ -1366,7 +1366,19 @@ export default function ClientPortalDashboard() {
                   value={payRef}
                   onChange={(e) => setPayRef(e.target.value)}
                   placeholder="KRM-889921"
-                  className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 font-mono text-sm dark:border-slate-700 dark:bg-slate-950"
+                  className="min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 font-mono text-sm dark:border-slate-700 dark:bg-slate-950"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-400">
+                  {isRtl ? 'تصوير أو إرفاق سند التحويل (كاميرا الجوال)' : 'Capture / Upload Transfer Receipt (Camera)'}
+                </label>
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  className="min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-950"
                 />
               </div>
 
