@@ -1,0 +1,10 @@
+{
+  "name": "eventledger-saas",
+  "private": true,
+  "scripts": {
+    "dev:web": "pnpm --filter web dev",
+    "build:web": "pnpm --filter web build",
+    "build:exe": "pnpm --filter desktop tauri build",
+    "build:apk": "BUILD_TARGET=NATIVE pnpm --filter web build && pnpm --filter mobile cap sync android"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "mobile",
+  "private": true,
+  "scripts": { "cap": "cap" },
+  "dependencies": {
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/cli": "^6.0.0",
+    "@capacitor/splash-screen": "^6.0.0",
+    "@capacitor/push-notifications": "^6.0.0",
+    "@capacitor-mlkit/barcode-scanning": "^6.0.0"
+  }
+}
