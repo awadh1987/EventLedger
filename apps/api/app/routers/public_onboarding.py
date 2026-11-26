@@ -208,11 +208,11 @@ async def register_tenant(payload: TenantRegisterRequest, db: AsyncSession = Dep
     await db.commit()
 
     token = create_access_token(owner.id, tenant.id, UserType.INTERNAL_STAFF, StaffRole.OWNER)
-    root_domain = settings.ROOT_DOMAIN
+    root_domain = settings.ROOT_DOMAIN.split(":")[0]
     return {
         "tenant_id": str(tenant.id),
         "slug": tenant.slug,
-        "workspace_url": f"http://{tenant.slug}.{root_domain}",
+        "workspace_url": f"https://{tenant.slug}.{root_domain}",
         "owner_id": str(owner.id),
         "access_token": token,
         "user": {

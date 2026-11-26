@@ -33,8 +33,8 @@ const AuthContext = createContext<AuthContextValue>({
   user: null,
   loading: true,
   isAuthenticated: false,
-  tenantSlug: 'almassa',
-  knownSlugs: ['almassa'],
+  tenantSlug: '',
+  knownSlugs: [],
   switchWorkspace: () => undefined,
   refreshUser: async () => undefined,
   setSession: () => undefined,
@@ -51,16 +51,15 @@ export function useAuthSession() {
 }
 
 function loadKnownSlugs(currentSlug: string): string[] {
-  const defaults = ['almassa'];
-  if (typeof window === 'undefined') return defaults;
+  if (typeof window === 'undefined') return currentSlug ? [currentSlug] : [];
   try {
     const raw = localStorage.getItem(KNOWN_SLUGS_KEY);
     const parsed = raw ? (JSON.parse(raw) as string[]) : [];
-    const merged = Array.from(new Set([...defaults, ...parsed, currentSlug].filter(Boolean)));
+    const merged = Array.from(new Set([...parsed, currentSlug].filter(Boolean)));
     localStorage.setItem(KNOWN_SLUGS_KEY, JSON.stringify(merged));
     return merged;
   } catch {
-    return Array.from(new Set([...defaults, currentSlug].filter(Boolean)));
+    return currentSlug ? [currentSlug] : [];
   }
 }
 
@@ -69,8 +68,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [user, setUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
-  const [tenantSlug, setTenantSlugState] = useState('almassa');
-  const [knownSlugs, setKnownSlugs] = useState<string[]>(['almassa']);
+  const [tenantSlug, setTenantSlugState] = useState('');
+  const [knownSlugs, setKnownSlugs] = useState<string[]>([]);
 
   useEffect(() => {
     const pathMatch = pathname.match(/^\/(?:(?:ar|en)\/)?t\/([a-z0-9-]+)/i);
@@ -156,7 +155,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     (redirectLocale?: string) => {
       clearAuthStorage();
       setUser(null);
-      setTenantSlugState('almassa');
+      setTenantSlugState('');
       const detectedLocale =
         redirectLocale ||
         (typeof window !== 'undefined' ? window.location.pathname.match(/^\/(ar|en)(?=\/|$)/)?.[1] : undefined) ||

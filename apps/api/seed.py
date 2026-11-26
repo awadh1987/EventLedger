@@ -1,9 +1,11 @@
 import asyncio
+import os
 from datetime import timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal, engine
 from app.core.security import hash_password
 from app.models.accounting import AccountingConfig, DepositStatus, Invoice, InvoiceStatus, PaymentMilestone
@@ -43,6 +45,10 @@ from app.services.accounting_service import DoubleEntryService
 
 
 async def seed_all() -> None:
+    env = (os.getenv("APP_ENV") or settings.APP_ENV).strip().lower()
+    if env == "production":
+        raise RuntimeError("Refusing to run demo seed.py when APP_ENV=production. Use bootstrap_prod.py instead.")
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

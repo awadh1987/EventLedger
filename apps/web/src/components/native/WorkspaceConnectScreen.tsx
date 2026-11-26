@@ -13,9 +13,10 @@ export function WorkspaceConnectScreen({
   onConnected?: (cfg: { slug: string; apiOrigin: string }) => void;
 }) {
   const isRtl = locale === 'ar';
-  const [slug, setSlug] = useState('almassa');
+  const rootDomain = (process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'events-ye.services').split(':')[0];
+  const [slug, setSlug] = useState('');
   const [mode, setMode] = useState<'CLOUD' | 'LAN'>('CLOUD');
-  const [lanIp, setLanIp] = useState('http://192.168.1.100:8000');
+  const [lanIp, setLanIp] = useState('');
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -25,7 +26,9 @@ export function WorkspaceConnectScreen({
     setTesting(true);
     const cleanSlug = slug.toLowerCase().trim();
     const apiOrigin =
-      mode === 'CLOUD' ? `https://${cleanSlug}.eventledger.cloud` : lanIp.replace(/\/$/, '');
+      mode === 'CLOUD'
+        ? `https://${cleanSlug}.${rootDomain}`
+        : lanIp.trim().replace(/\/api\/v1\/?$/, '').replace(/\/+$/, '');
 
     try {
       await apiFetch<{ status: string }>('/health', { originOverride: apiOrigin, skipAuth: true });
@@ -64,7 +67,7 @@ export function WorkspaceConnectScreen({
             <input
               value={slug}
               onChange={(e) => setSlug(e.target.value)}
-              placeholder="almassa"
+              placeholder="your-venue-slug"
               required
               className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
             />
@@ -93,7 +96,7 @@ export function WorkspaceConnectScreen({
             <input
               value={lanIp}
               onChange={(e) => setLanIp(e.target.value)}
-              placeholder="http://192.168.1.100:8000"
+              placeholder="http://192.168.x.x:8000/api/v1"
               className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs"
             />
           )}

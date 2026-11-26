@@ -6,8 +6,8 @@ const intlMiddleware = createMiddleware({
   defaultLocale: 'ar',
 });
 
-const ROOT_DOMAIN = (process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'eventledger.local:3000').split(':')[0].toLowerCase();
-const ROOT_DOMAINS = Array.from(new Set([ROOT_DOMAIN, 'eventledger.local', 'eventledger.cloud']));
+const ROOT_DOMAIN = (process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'events-ye.services').split(':')[0].toLowerCase();
+const ROOT_DOMAINS = Array.from(new Set([ROOT_DOMAIN]));
 
 export function middleware(req: NextRequest) {
   const { pathname, search } = req.nextUrl;

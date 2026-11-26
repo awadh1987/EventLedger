@@ -78,7 +78,7 @@ export function getApiBaseUrl(): string {
 }
 
 export function getTenantSlug(): string | null {
-  if (typeof window === 'undefined') return process.env.NEXT_PUBLIC_DEFAULT_TENANT_SLUG || 'almassa';
+  if (typeof window === 'undefined') return process.env.NEXT_PUBLIC_DEFAULT_TENANT_SLUG || null;
 
   const pathMatch = window.location.pathname.match(/^\/(?:(?:ar|en)\/)?t\/([a-z0-9-]+)/i);
   if (pathMatch?.[1]) return pathMatch[1].toLowerCase();
@@ -87,8 +87,8 @@ export function getTenantSlug(): string | null {
   if (native?.slug) return native.slug.toLowerCase();
 
   const host = window.location.hostname.toLowerCase();
-  const rootDomain = (process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'eventledger.local:3000').split(':')[0].toLowerCase();
-  const rootDomains = Array.from(new Set([rootDomain, 'eventledger.local', 'eventledger.cloud']));
+  const rootDomain = (process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'events-ye.services').split(':')[0].toLowerCase();
+  const rootDomains = Array.from(new Set([rootDomain]));
 
   for (const domain of rootDomains) {
     if (host.endsWith(`.${domain}`)) {
@@ -100,11 +100,11 @@ export function getTenantSlug(): string | null {
   const stored = localStorage.getItem(SLUG_KEY) || localStorage.getItem(ALT_SLUG_KEY);
   if (stored) return stored.toLowerCase();
 
-  return process.env.NEXT_PUBLIC_DEFAULT_TENANT_SLUG || 'almassa';
+  return process.env.NEXT_PUBLIC_DEFAULT_TENANT_SLUG || null;
 }
 
 export function getActiveTenantSlug(): string {
-  return getTenantSlug() || 'almassa';
+  return getTenantSlug() || '';
 }
 
 export function setTenantSlug(slug: string | null): void {

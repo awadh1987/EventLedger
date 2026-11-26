@@ -37,7 +37,7 @@ export const PLATFORM_LOGO = '/brand/eventledger-logo.svg';
 export const DEFAULT_BRANDING: TenantBrandingConfig = {
   id: '',
   venueName: 'EventLedger',
-  slug: 'almassa',
+  slug: '',
   currency: 'YER',
   taxRate: 5,
   primaryColor: '#D4AF37',

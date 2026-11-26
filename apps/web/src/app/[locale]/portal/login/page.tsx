@@ -20,6 +20,7 @@ interface AuthResponse {
   dev_otp?: string;
 }
 
+const showDemo = process.env.NEXT_PUBLIC_ENABLE_DEMO === 'true';
 const DEMO_CLIENT = { id: 'ahmed@client.local', pw: 'Client@2026' };
 
 const inputCls =
@@ -41,10 +42,10 @@ function ClientPortalLoginInner() {
 
   const hasSlugInPath = /^\/(?:ar|en)\/t\/([a-z0-9-]+)/i.test(pathname);
   const [venues, setVenues] = useState<{ name: string; slug: string }[]>([]);
-  const [selectedSlug, setSelectedSlug] = useState<string>(tenantSlug || 'almassa');
+  const [selectedSlug, setSelectedSlug] = useState<string>(tenantSlug || '');
 
   useEffect(() => {
-    setSelectedSlug(tenantSlug || 'almassa');
+    setSelectedSlug(tenantSlug || '');
   }, [tenantSlug]);
 
   useEffect(() => {
@@ -288,8 +289,8 @@ function ClientPortalLoginInner() {
           {bookingCode && (
             <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-600 dark:text-amber-300">
               {tr(
-                `تم تسجيل حجزك (${bookingCode}). سجّل الدخول برقم جوالك وكلمة المرور الافتراضية (Client@2026) أو اطلب رمز OTP.`,
-                `Booking ${bookingCode} is reserved. Sign in with your phone and default password (Client@2026) or request an OTP.`
+                `تم تسجيل حجزك (${bookingCode}). سجّل الدخول برقم جوالك وكلمة المرور أو اطلب رمز OTP.`,
+                `Booking ${bookingCode} is reserved. Sign in with your phone and password or request an OTP.`
               )}
             </div>
           )}
@@ -317,17 +318,19 @@ function ClientPortalLoginInner() {
               <button type="submit" disabled={loading} className={btnCls}>
                 {loading ? tr('جارٍ الدخول...', 'Signing in...') : tr('دخول', 'Sign In')}
               </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setIdentifier(DEMO_CLIENT.id);
-                  setPassword(DEMO_CLIENT.pw);
-                }}
-                className="flex w-full items-center justify-center gap-1 rounded border border-slate-200 px-2 py-1.5 text-[11px] hover:border-[var(--brand-primary)] dark:border-slate-800"
-              >
-                <KeyRound className="h-3.5 w-3.5" />
-                {tr('تعبئة عميل تجريبي', 'Fill demo client')} ({DEMO_CLIENT.id})
-              </button>
+              {showDemo && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIdentifier(DEMO_CLIENT.id);
+                    setPassword(DEMO_CLIENT.pw);
+                  }}
+                  className="flex w-full items-center justify-center gap-1 rounded border border-slate-200 px-2 py-1.5 text-[11px] hover:border-[var(--brand-primary)] dark:border-slate-800"
+                >
+                  <KeyRound className="h-3.5 w-3.5" />
+                  {tr('تعبئة عميل تجريبي', 'Fill demo client')} ({DEMO_CLIENT.id})
+                </button>
+              )}
             </form>
           )}
 

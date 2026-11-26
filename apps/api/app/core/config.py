@@ -2,9 +2,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    APP_ENV: str = "development"
     BRAND_NAME_EN: str = "EventLedger"
     BRAND_NAME_AR: str = "إيفنت ليدجر"
-    ROOT_DOMAIN: str = "eventledger.local:3000"
+    ROOT_DOMAIN: str = "events-ye.services"
     DATABASE_URL: str = "postgresql+asyncpg://venue_admin:venue_secret_password@localhost:5432/venue_erp_db"
     REDIS_URL: str = "redis://localhost:6379"
     JWT_SECRET: str = "change-this-to-a-64-char-random-secret-key-for-eventledger"

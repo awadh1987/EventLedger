@@ -18,9 +18,10 @@ export default function StaffLoginPage() {
   const router = useRouter();
   const { setSession } = useAuth();
 
+  const showDemo = process.env.NEXT_PUBLIC_ENABLE_DEMO === 'true';
   const [showConnect, setShowConnect] = useState(isNativeRuntime() && !getNativeWorkspace());
-  const [identifier, setIdentifier] = useState('owner@almassa.eventledger.local');
-  const [password, setPassword] = useState('Almassa@2026');
+  const [identifier, setIdentifier] = useState('');
+  const [password, setPassword] = useState('');
   const [otpStep, setOtpStep] = useState(false);
   const [otpCode, setOtpCode] = useState('');
   const [devOtpHint, setDevOtpHint] = useState<string | null>(null);
@@ -131,6 +132,7 @@ export default function StaffLoginPage() {
                 <input
                   value={identifier}
                   onChange={(e) => setIdentifier(e.target.value)}
+                  placeholder="owner@your-venue.com"
                   required
                   className="min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
                 />
@@ -187,33 +189,41 @@ export default function StaffLoginPage() {
           )}
 
           <div className="border-t border-slate-200 pt-3 dark:border-slate-800">
-            <p className="mb-2 flex items-center gap-1 text-[11px] font-semibold text-slate-500">
-              <KeyRound className="h-3.5 w-3.5" />
-              {isRtl ? 'حسابات التجربة السريعة (الموظفون والملاك):' : 'Quick Demo Accounts (Staff, Owners & Admin):'}
-            </p>
-            <div className="grid grid-cols-2 gap-1.5 text-[11px]">
-              {[
-                { label: 'Owner', id: 'owner@almassa.eventledger.local', pw: 'Almassa@2026' },
-                { label: 'Finance', id: 'finance@almassa.eventledger.local', pw: 'Finance@2026' },
-                { label: 'Gate', id: 'gate@almassa.eventledger.local', pw: 'Gate@2026' },
-                { label: 'Super Admin', id: 'admin@eventledger.cloud', pw: 'SuperAdmin@2026' },
-              ].map((acc) => (
-                <button
-                  key={acc.label}
-                  type="button"
-                  onClick={() => {
-                    setIdentifier(acc.id);
-                    setPassword(acc.pw);
-                  }}
-                  className="rounded border border-slate-200 px-2 py-1.5 text-start hover:border-[var(--brand-primary)] dark:border-slate-800"
-                >
-                  {acc.label}
-                </button>
-              ))}
-            </div>
+            {showDemo && (
+              <>
+                <p className="mb-2 flex items-center gap-1 text-[11px] font-semibold text-slate-500">
+                  <KeyRound className="h-3.5 w-3.5" />
+                  {isRtl ? 'حسابات التجربة السريعة:' : 'Quick Demo Accounts:'}
+                </p>
+                <div className="mb-3 grid grid-cols-2 gap-1.5 text-[11px]">
+                  {[
+                    { label: 'Owner', id: 'owner@almassa.eventledger.local', pw: 'Almassa@2026' },
+                    { label: 'Finance', id: 'finance@almassa.eventledger.local', pw: 'Finance@2026' },
+                    { label: 'Gate', id: 'gate@almassa.eventledger.local', pw: 'Gate@2026' },
+                    { label: 'Super Admin', id: 'admin@eventledger.cloud', pw: 'SuperAdmin@2026' },
+                  ].map((acc) => (
+                    <button
+                      key={acc.label}
+                      type="button"
+                      onClick={() => {
+                        setIdentifier(acc.id);
+                        setPassword(acc.pw);
+                      }}
+                      className="rounded border border-slate-200 px-2 py-1.5 text-start hover:border-[var(--brand-primary)] dark:border-slate-800"
+                    >
+                      {acc.label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
             <Link
-              href={tenantPath(locale, getActiveTenantSlug(), '/portal/login')}
-              className="mt-3 block text-center text-xs font-medium text-[var(--brand-primary,#D4AF37)] hover:underline"
+              href={
+                getActiveTenantSlug()
+                  ? tenantPath(locale, getActiveTenantSlug(), '/portal/login')
+                  : `/${locale}/login`
+              }
+              className="block text-center text-xs font-medium text-[var(--brand-primary,#D4AF37)] hover:underline"
             >
               {isRtl ? 'هل أنت عميل؟ سجّل الدخول من بوابة العميل ›' : 'Are you a client? Go to the Client Portal sign-in ›'}
             </Link>

@@ -119,7 +119,7 @@ export default function SaasOwnerPortalPage() {
     owner_name: '',
     owner_phone: '',
     owner_email: '',
-    owner_password: 'VenueOwner@2026',
+    owner_password: '',
     currency: 'YER',
     subscription_tier: 'PRO' as SubscriptionTier,
   });
@@ -291,7 +291,7 @@ export default function SaasOwnerPortalPage() {
     }
   };
 
-  const activeSlug = overview?.slug || tenantSlug || 'almassa';
+  const activeSlug = overview?.slug || tenantSlug || '';
   const waPct = overview?.monthly_whatsapp_quota
     ? Math.min(100, Math.round((overview.whatsapp_used_this_month / overview.monthly_whatsapp_quota) * 100))
     : 0;
@@ -655,7 +655,7 @@ export default function SaasOwnerPortalPage() {
             <div className="space-y-2 text-xs text-slate-600 dark:text-slate-300">
               <div className="flex items-center gap-2">
                 <Building2 className="h-4 w-4 shrink-0 text-amber-500" />
-                <span dir="ltr">{`https://${regForm.slug || 'your-venue'}.eventledger.cloud`}</span>
+                <span dir="ltr">{`https://${regForm.slug || 'your-venue'}.${(process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'events-ye.services').split(':')[0]}`}</span>
               </div>
               <div className="flex items-center gap-2">
                 <Shield className="h-4 w-4 shrink-0 text-emerald-500" />
