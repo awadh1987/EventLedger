@@ -3,7 +3,7 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'EventLedger | إيفنت ليدجر — Venue & Conference SaaS ERP',
+  title: 'EventLedger — Venue & Conference Enterprise ERP',
   description: 'Multi-tenant wedding hall, venue & conference ERP and interactive client portal.',
 };
 

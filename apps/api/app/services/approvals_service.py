@@ -87,7 +87,7 @@ class ApprovalsService:
         approver_id: uuid.UUID,
         approver_user_type: UserType,
         approver_staff_role: Optional[StaffRole],
-        decision: ApprovalStatus,
+        decision: ApprovalStatus | str,
         rejection_reason: Optional[str] = None,
     ) -> dict:
         approval = (
@@ -120,23 +120,43 @@ class ApprovalsService:
                     detail="Only the event's primary client may resolve this client approval gate",
                 )
         elif approval.required_approver_role == "OPS_MANAGER":
-            allowed_staff = {StaffRole.OWNER, StaffRole.OPS_MANAGER}
+            allowed_staff = {StaffRole.OWNER, StaffRole.ADMIN, StaffRole.OPS_MANAGER}
             if approver_user_type != UserType.SUPER_ADMIN and (
                 approver_user_type != UserType.INTERNAL_STAFF or approver_staff_role not in allowed_staff
             ):
                 raise HTTPException(
                     status_code=403,
-                    detail="Only OPS_MANAGER or OWNER may resolve internal approval gates",
+                    detail="Only OPS_MANAGER, ADMIN, or OWNER may resolve internal approval gates",
                 )
 
         tenant = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one()
+        dec_str = decision.value if isinstance(decision, ApprovalStatus) else str(decision).upper()
 
-        approval.status = decision
+        if dec_str == "RETURNED_FOR_AMENDMENT":
+            approval.status = ApprovalStatus.REJECTED
+            approval.approved_by_id = approver_id
+            approval.rejection_reason = f"[RETURNED_FOR_AMENDMENT] {rejection_reason or ''}".strip()
+            approval.resolved_at = utcnow()
+            draft.status = DraftStatus.DRAFT
+            db.add(
+                AuditLog(
+                    tenant_id=tenant_id,
+                    event_id=event.id,
+                    actor_id=approver_id,
+                    action="DRAFT_RETURNED_FOR_AMENDMENT",
+                    new_value={"draft_id": str(draft.id), "remarks": rejection_reason},
+                )
+            )
+            await db.commit()
+            return {"status": "RETURNED_FOR_AMENDMENT", "draft_id": str(draft.id), "remarks": rejection_reason}
+
+        dec_enum = ApprovalStatus(dec_str)
+        approval.status = dec_enum
         approval.approved_by_id = approver_id
         approval.rejection_reason = rejection_reason
         approval.resolved_at = utcnow()
 
-        if decision == ApprovalStatus.REJECTED:
+        if dec_enum == ApprovalStatus.REJECTED:
             draft.status = DraftStatus.REJECTED
             db.add(
                 AuditLog(

@@ -28,6 +28,8 @@ from app.models.accounting import (
 )
 from app.models.base import RecordLifecycle, utcnow
 from app.models.events import AuditLog, Event, EventStatus
+from app.models.users import User
+from app.services.comms_service import CommsService
 
 
 class DoubleEntryService:
@@ -125,6 +127,20 @@ class DoubleEntryService:
                 .limit(1)
             )
         ).first()
+        if not row and utcnow().year <= entry_date.year <= utcnow().year + 6:
+            await DoubleEntryService.ensure_fiscal_year_with_periods(db, tenant_id, entry_date.year)
+            row = (
+                await db.execute(
+                    select(AccountingPeriod, FiscalYear)
+                    .join(FiscalYear, AccountingPeriod.fiscal_year_id == FiscalYear.id)
+                    .where(
+                        AccountingPeriod.tenant_id == tenant_id,
+                        AccountingPeriod.start_date <= entry_date,
+                        AccountingPeriod.end_date >= entry_date,
+                    )
+                    .limit(1)
+                )
+            ).first()
         if not row:
             raise HTTPException(
                 status_code=400,
@@ -470,8 +486,15 @@ class DoubleEntryService:
         milestone.paid_amount = amount
         milestone.payment_method = payment_method
         milestone.status = "PAID"
+        milestone.reviewer_remarks = None
         milestone.paid_at = utcnow()
         milestone.upload_token_jti = None
+
+        ev_obj = (
+            await db.execute(
+                select(Event).where(Event.id == invoice.event_id, Event.tenant_id == tenant_id)
+            )
+        ).scalar_one_or_none()
 
         if effective_deposit:
             invoice.deposit_status = DepositStatus.HELD
@@ -493,13 +516,8 @@ class DoubleEntryService:
             elif total_paid > Decimal("0.00"):
                 invoice.status = InvoiceStatus.PARTIALLY_PAID
 
-            ev = (
-                await db.execute(
-                    select(Event).where(Event.id == invoice.event_id, Event.tenant_id == tenant_id)
-                )
-            ).scalar_one_or_none()
-            if ev and ev.status == EventStatus.HOLD_48H:
-                ev.status = EventStatus.CONFIRMED
+            if ev_obj and ev_obj.status == EventStatus.HOLD_48H:
+                ev_obj.status = EventStatus.CONFIRMED
 
         db.add(
             AuditLog(
@@ -517,6 +535,20 @@ class DoubleEntryService:
                 },
             )
         )
+        if ev_obj:
+            client = (await db.execute(select(User).where(User.id == ev_obj.primary_client_id))).scalar_one_or_none()
+            if client:
+                await CommsService.notify_and_whatsapp(
+                    db,
+                    tenant_id,
+                    title=f"تم اعتماد الدفعة المالية · {entry.entry_number}",
+                    content=f"تم التحقق المحاسبي من الدفعة ({milestone.title}) بمبلغ {amount:,.2f} للفعالية {ev_obj.event_code}.",
+                    category="STATUS_UPDATE",
+                    event_id=ev_obj.id,
+                    recipient_user_id=client.id,
+                    recipient_phone=client.phone,
+                    send_whatsapp=True,
+                )
         await db.commit()
         return {
             "status": "VERIFIED",

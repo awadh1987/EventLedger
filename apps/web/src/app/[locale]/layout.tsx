@@ -1,17 +1,12 @@
 import React from 'react';
-import type { Metadata } from 'next';
 import arMessages from '@/messages/ar.json';
 import enMessages from '@/messages/en.json';
 import { IntlProvider } from '@/components/providers/intl-provider';
 import { ThemeBrandingProvider } from '@/components/providers/theme-branding-provider';
 import { AuthProvider } from '@/components/providers/auth-provider';
 import { LocaleDirSync } from '@/components/providers/locale-dir-sync';
-
-export const metadata: Metadata = {
-  icons: {
-    icon: '/favicon.svg',
-  },
-};
+import { NavigationHistoryProvider } from '@/components/navigation/NavigationHistoryProvider';
+import { WorkspaceSidebar } from '@/components/layout/WorkspaceSidebar';
 
 export function generateStaticParams() {
   return [{ locale: 'ar' }, { locale: 'en' }];
@@ -32,7 +27,11 @@ export default function LocaleLayout({
       <LocaleDirSync locale={locale} />
       <IntlProvider locale={locale} messages={messages}>
         <ThemeBrandingProvider>
-          <AuthProvider>{children}</AuthProvider>
+          <AuthProvider>
+            <NavigationHistoryProvider>
+              <WorkspaceSidebar locale={locale}>{children}</WorkspaceSidebar>
+            </NavigationHistoryProvider>
+          </AuthProvider>
         </ThemeBrandingProvider>
       </IntlProvider>
     </div>

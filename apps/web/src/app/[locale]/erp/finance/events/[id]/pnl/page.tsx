@@ -6,6 +6,7 @@ import { Plus, RotateCcw, Trash2 } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { AppHeader } from '@/components/layout/AppHeader';
 import { MobileBottomNav } from '@/components/layout/MobileBottomNav';
+import { LookupSelect } from '@/components/ui/LookupSelect';
 import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
 
 interface ExpenseItem {
@@ -178,20 +179,27 @@ function EventPnlInner() {
                   {pnl.security_deposit_held.toLocaleString()}
                 </div>
                 {pnl.security_deposit_held > 0 && (
-                  <div className="flex gap-1.5 pt-1">
-                    <select
-                      value={refundMethod}
-                      onChange={(e) => setRefundMethod(e.target.value)}
-                      className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] dark:border-slate-700 dark:bg-slate-900"
-                    >
-                      <option value="KURAIMI_BANK">KURAIMI_BANK</option>
-                      <option value="CASH">CASH</option>
-                    </select>
+                  <div className="flex flex-wrap items-start gap-1.5 pt-1">
+                    <div className="min-w-[140px] flex-1">
+                      <LookupSelect
+                        category="REFUND_METHOD"
+                        value={refundMethod}
+                        onChange={setRefundMethod}
+                        locale={locale}
+                        allowOther
+                        allowPromote
+                        fallbackOptions={[
+                          { value: 'KURAIMI_BANK', labelAr: 'تحويل بنك الكريمي', labelEn: 'Kuraimi Bank' },
+                          { value: 'CASH', labelAr: 'نقدي (CASH)', labelEn: 'Cash (CASH)' },
+                        ]}
+                        className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] dark:border-slate-700 dark:bg-slate-900"
+                      />
+                    </div>
                     <button
                       type="button"
                       disabled={busy}
                       onClick={refundDeposit}
-                      className="inline-flex items-center gap-1 rounded bg-amber-500 px-2.5 py-1 text-[11px] font-bold text-slate-950"
+                      className="inline-flex items-center gap-1 rounded bg-amber-500 px-2.5 py-1.5 text-[11px] font-bold text-slate-950"
                     >
                       <RotateCcw className="h-3 w-3" />
                       <span>{tr('رد التأمين', 'Refund')}</span>
@@ -208,16 +216,22 @@ function EventPnlInner() {
                 {tr('تسجيل مصروف فعالية (مع ترحيل تلقائي للأستاذ العام)', 'Record Event Expense (Auto GL Posting)')}
               </SpotlightHeading>
               <form onSubmit={addExpense} className="grid gap-3 sm:grid-cols-5">
-                <select
+                <LookupSelect
+                  category="EXPENSE_CATEGORY"
                   value={expCategory}
-                  onChange={(e) => setExpCategory(e.target.value)}
-                  className="min-h-[42px] rounded-lg border border-slate-300 bg-white px-3 text-xs dark:border-slate-700 dark:bg-slate-950"
-                >
-                  <option value="CATERING">{tr('تكلفة الضيافة', 'CATERING')}</option>
-                  <option value="STAFFING">{tr('أجور تشغيلية', 'STAFFING')}</option>
-                  <option value="DECOR">{tr('ديكور وزهور', 'DECOR')}</option>
-                  <option value="UTILITIES">{tr('كهرباء ومرافق', 'UTILITIES')}</option>
-                </select>
+                  onChange={setExpCategory}
+                  locale={locale}
+                  allowOther
+                  allowPromote
+                  required
+                  fallbackOptions={[
+                    { value: 'CATERING', labelAr: 'تكلفة الضيافة', labelEn: 'Catering Cost' },
+                    { value: 'STAFFING', labelAr: 'أجور تشغيلية', labelEn: 'Staffing' },
+                    { value: 'DECOR', labelAr: 'ديكور وزهور', labelEn: 'Decor & Florals' },
+                    { value: 'UTILITIES', labelAr: 'كهرباء ومرافق', labelEn: 'Utilities' },
+                  ]}
+                  className="min-h-[42px] w-full rounded-lg border border-slate-300 bg-white px-3 text-xs dark:border-slate-700 dark:bg-slate-950"
+                />
                 <input
                   required
                   value={expDesc}
@@ -235,19 +249,26 @@ function EventPnlInner() {
                   placeholder={tr('المبلغ', 'Amount')}
                   className="min-h-[42px] rounded-lg border border-slate-300 bg-white px-3 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
                 />
-                <div className="flex gap-2">
-                  <select
-                    value={expMethod}
-                    onChange={(e) => setExpMethod(e.target.value)}
-                    className="min-h-[42px] rounded-lg border border-slate-300 bg-white px-2 text-xs dark:border-slate-700 dark:bg-slate-950"
-                  >
-                    <option value="CASH">CASH</option>
-                    <option value="KURAIMI_BANK">BANK</option>
-                  </select>
+                <div className="flex items-start gap-2">
+                  <div className="min-w-[115px] flex-1">
+                    <LookupSelect
+                      category="PAYMENT_METHOD"
+                      value={expMethod}
+                      onChange={setExpMethod}
+                      locale={locale}
+                      allowOther
+                      allowPromote
+                      fallbackOptions={[
+                        { value: 'CASH', labelAr: 'نقدي (CASH)', labelEn: 'Cash (CASH)' },
+                        { value: 'KURAIMI_BANK', labelAr: 'بنك الكريمي', labelEn: 'Kuraimi Bank' },
+                      ]}
+                      className="min-h-[42px] w-full rounded-lg border border-slate-300 bg-white px-2 text-xs dark:border-slate-700 dark:bg-slate-950"
+                    />
+                  </div>
                   <button
                     type="submit"
                     disabled={busy}
-                    className="min-h-[42px] flex-1 rounded-lg bg-[var(--brand-primary,#D4AF37)] px-3 text-xs font-bold text-slate-950"
+                    className="min-h-[42px] shrink-0 rounded-lg bg-[var(--brand-primary,#D4AF37)] px-3 text-xs font-bold text-slate-950"
                   >
                     {tr('تسجيل', 'Add')}
                   </button>

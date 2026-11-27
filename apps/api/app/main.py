@@ -8,18 +8,23 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.tenant_middleware import TenantResolverMiddleware
 import app.models.events_extensions  # noqa: F401
+import app.models.governance  # noqa: F401
 from app.routers import (
     admin,
     approvals,
     auth,
     bookings,
+    contracts_ai,
     finance,
+    governance,
     lifecycle_ops,
     offline_sync,
     phase6_ops,
     portal,
     public_onboarding,
+    security_ops,
     tenant_settings,
+    users_rbac,
 )
 
 app = FastAPI(
@@ -50,6 +55,10 @@ app.include_router(finance.router)
 app.include_router(lifecycle_ops.router)
 app.include_router(phase6_ops.router)
 app.include_router(tenant_settings.router)
+app.include_router(security_ops.router)
+app.include_router(contracts_ai.router)
+app.include_router(users_rbac.router)
+app.include_router(governance.router)
 app.include_router(offline_sync.router)
 
 

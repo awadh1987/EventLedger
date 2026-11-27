@@ -44,7 +44,7 @@ export default function StaffLoginPage() {
   const isStaffUser = (u: AuthUser) => u.user_type === 'SUPER_ADMIN' || u.user_type === 'INTERNAL_STAFF';
 
   const routeAfterLogin = (u: AuthUser) => {
-    const slug = getActiveTenantSlug();
+    const slug = u.tenant_slug || getActiveTenantSlug();
     if (u.user_type === 'SUPER_ADMIN') {
       router.push(`/${locale}/admin`);
     } else if (u.staff_role === 'SECURITY') {
@@ -63,7 +63,8 @@ export default function StaffLoginPage() {
       );
       return false;
     }
-    setSession(token, u);
+    const slug = u.tenant_slug || getActiveTenantSlug();
+    setSession(token, u, slug || undefined);
     routeAfterLogin(u);
     return true;
   };

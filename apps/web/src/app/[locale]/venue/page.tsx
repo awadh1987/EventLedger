@@ -27,7 +27,8 @@ import { MobileBottomNav } from '@/components/layout/MobileBottomNav';
 import { useAuthSession } from '@/components/providers/auth-provider';
 import { useTenantBranding } from '@/components/providers/theme-branding-provider';
 import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
-import { apiFetch, tenantPath } from '@/lib/api';
+import { apiFetch, localizedVenueName, tenantPath } from '@/lib/api';
+import { resolveTenantSlug } from '@/lib/tenant-slug';
 
 interface StorefrontHall {
   id: string;
@@ -83,6 +84,7 @@ export default function TenantVenueStorefrontPage() {
   const isRtl = locale === 'ar';
   const tr = (ar: string, en: string) => (isRtl ? ar : en);
   const { tenantSlug } = useAuthSession();
+  const effectiveSlug = tenantSlug || resolveTenantSlug();
   const branding = useTenantBranding();
 
   const [mounted, setMounted] = useState(false);
@@ -96,9 +98,9 @@ export default function TenantVenueStorefrontPage() {
   }, []);
 
   useEffect(() => {
-    if (!tenantSlug) return;
+    if (!effectiveSlug) return;
     let alive = true;
-    apiFetch<StorefrontPayload>(`/api/v1/public/tenants/${tenantSlug}/storefront`, { skipAuth: true }, tenantSlug)
+    apiFetch<StorefrontPayload>(`/api/v1/public/tenants/${effectiveSlug}/storefront`, { skipAuth: true }, effectiveSlug)
       .then((data) => {
         if (!alive) return;
         setStorefront(data);
@@ -110,13 +112,16 @@ export default function TenantVenueStorefrontPage() {
     return () => {
       alive = false;
     };
-  }, [tenantSlug]);
+  }, [effectiveSlug]);
 
-  const tenantName = storefront?.name || branding.venueName || tr('واجهة القاعة', 'Venue Storefront');
+  const rawTenantName = storefront?.name || branding.venueName || '';
+  const tenantName = localizedVenueName(rawTenantName, locale) || tr('واجهة القاعة', 'Venue Storefront');
   const currency = storefront?.currency || branding.currency || 'YER';
   const sfBrand = storefront?.branding;
   const heroLogo = mounted ? sfBrand?.logoDarkUrl || sfBrand?.logoLightUrl || branding.logoDarkUrl || branding.logoLightUrl : null;
-  const heroTitle = isRtl ? sfBrand?.heroTitleAr || tenantName : sfBrand?.heroTitleEn || tenantName;
+  const heroTitle = isRtl
+    ? localizedVenueName(sfBrand?.heroTitleAr || '', 'ar') || sfBrand?.heroTitleAr || tenantName
+    : localizedVenueName(sfBrand?.heroTitleEn || '', 'en') || sfBrand?.heroTitleEn || tenantName;
   const heroSubtitle = isRtl
     ? sfBrand?.heroSubtitleAr || sfBrand?.heroTaglineAr
     : sfBrand?.heroSubtitleEn || sfBrand?.heroTaglineEn;
@@ -151,12 +156,12 @@ export default function TenantVenueStorefrontPage() {
                     className="h-14 w-14 rounded-xl border border-white/20 bg-white/90 object-contain p-1"
                   />
                 )}
-                {tenantSlug && (
+                {effectiveSlug && (
                   <span
                     dir="ltr"
                     className="inline-flex items-center gap-1.5 rounded-full border border-[var(--brand-primary,#D4AF37)]/50 bg-slate-950/70 px-3 py-1 font-mono text-xs font-bold text-[var(--brand-primary,#D4AF37)]"
                   >
-                    <Sparkles className="h-3.5 w-3.5" />/{tenantSlug}
+                    <Sparkles className="h-3.5 w-3.5" />/{effectiveSlug}
                   </span>
                 )}
               </div>
@@ -186,7 +191,7 @@ export default function TenantVenueStorefrontPage() {
                   </button>
                 )}
                 <Link
-                  href={tenantPath(locale, tenantSlug, '/portal/login')}
+                  href={tenantPath(locale, effectiveSlug, '/portal/login')}
                   className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-white/30 bg-white/10 px-4 py-2.5 text-xs font-semibold text-white backdrop-blur"
                 >
                   <UserRound className="h-4 w-4" />
@@ -207,7 +212,7 @@ export default function TenantVenueStorefrontPage() {
                 )}
               </p>
               <Link
-                href={tenantPath(locale, tenantSlug, '/portal/dashboard')}
+                href={tenantPath(locale, effectiveSlug, '/portal/dashboard')}
                 className="mt-3 inline-flex items-center gap-1 font-bold text-[var(--brand-primary,#D4AF37)] hover:underline"
               >
                 <span>{tr('متابعة حجوزاتي في بوابة العميل', 'Open My Bookings')}</span>
@@ -229,15 +234,14 @@ export default function TenantVenueStorefrontPage() {
                 const isSelected = selectedHallId === hall.id;
                 const partner = hall.combinable_with_hall_id
                   ? halls.find((h) => h.id === hall.combinable_with_hall_id)
-                  : undefined;
+                  : halls.find((h) => h.id !== hall.id && h.combinable_with_hall_id === hall.id);
                 const photos = hall.gallery_urls && hall.gallery_urls.length > 0 ? hall.gallery_urls : ['/images/venue_banquet_table.jpg'];
 
                 return (
                   <SpotlightCard
                     key={hall.id}
-                    className={`flex flex-col justify-between gap-4 !p-0 overflow-hidden ${
-                      isSelected ? 'ring-2 ring-[var(--brand-primary,#D4AF37)]' : ''
-                    }`}
+                    className={`flex flex-col justify-between gap-4 !p-0 overflow-hidden ${isSelected ? 'ring-2 ring-[var(--brand-primary,#D4AF37)]' : ''
+                      }`}
                   >
                     <div>
                       {/* Photo Gallery Grid */}
@@ -381,11 +385,10 @@ export default function TenantVenueStorefrontPage() {
                         setAppliedOffer(isApplied ? null : offer);
                         if (!isApplied) document.getElementById('venue-calendar')?.scrollIntoView({ behavior: 'smooth' });
                       }}
-                      className={`inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-xl text-xs font-bold ${
-                        isApplied
-                          ? 'bg-emerald-600 text-white'
-                          : 'border border-[var(--brand-primary,#D4AF37)] text-[var(--brand-primary,#D4AF37)]'
-                      }`}
+                      className={`inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-xl text-xs font-bold ${isApplied
+                        ? 'bg-emerald-600 text-white'
+                        : 'border border-[var(--brand-primary,#D4AF37)] text-[var(--brand-primary,#D4AF37)]'
+                        }`}
                     >
                       <CheckCircle2 className="h-4 w-4" />
                       <span>{isApplied ? tr('تم تطبيق العرض ✓', 'Offer Applied ✓') : tr('تطبيق العرض على الحجز', 'Apply Offer')}</span>
@@ -401,7 +404,7 @@ export default function TenantVenueStorefrontPage() {
         <section id="venue-calendar" className="scroll-mt-20 space-y-4">
           <ThreeMonthBookingEngine
             mode="TENANT_STOREFRONT"
-            tenantSlug={tenantSlug}
+            tenantSlug={effectiveSlug}
             locale={locale}
             selectedHallId={selectedHallId}
             appliedOffer={appliedOffer}
@@ -459,7 +462,7 @@ export default function TenantVenueStorefrontPage() {
             <span>
               {tenantName} · {tr('مدعوم بواسطة EventLedger', 'Powered by EventLedger')}
             </span>
-            <Link href={tenantPath(locale, tenantSlug, '/staff-login')} className="font-semibold text-[var(--brand-primary,#D4AF37)] hover:underline">
+            <Link href={tenantPath(locale, effectiveSlug, '/staff-login')} className="font-semibold text-[var(--brand-primary,#D4AF37)] hover:underline">
               {tr('دخول موظفي القاعة ونظام ERP ›', 'Venue Staff ERP Login ›')}
             </Link>
           </div>
@@ -488,8 +491,8 @@ export default function TenantVenueStorefrontPage() {
       )}
 
       <MobileBottomNav persona="CLIENT" locale={locale} />
-    
-      <HallMediaShowcase />
-</div>
+
+      <HallMediaShowcase locale={locale} tenantSlug={effectiveSlug} />
+    </div>
   );
 }

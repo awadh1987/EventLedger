@@ -34,7 +34,7 @@ class BatchSyncRequest(BaseModel):
 async def gate_check_in(
     body: GateCheckInBody,
     auth: AuthContext = Depends(
-        require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.OPS_MANAGER, StaffRole.SECURITY})
+        require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.ADMIN, StaffRole.OPS_MANAGER, StaffRole.SECURITY})
     ),
     db: AsyncSession = Depends(get_db),
 ):
@@ -48,6 +48,15 @@ async def gate_check_in(
         return {"result": "INVALID", "holder_name": "", "pass_type": "", "event_code": "", "checked_in_at": None}
 
     ev = (await db.execute(select(Event).where(Event.id == gp.event_id, Event.tenant_id == auth.tenant_id))).scalar_one_or_none()
+    if (gp.clearance_status or "APPROVED") != "APPROVED":
+        return {
+            "result": f"CLEARANCE_{gp.clearance_status}",
+            "holder_name": gp.holder_name,
+            "pass_type": gp.pass_type,
+            "event_code": ev.event_code if ev else "",
+            "remarks": gp.remarks,
+            "checked_in_at": None,
+        }
     now = utcnow()
     if gp.is_checked_in:
         return {
@@ -124,7 +133,14 @@ async def get_offline_manifest(
                 "event_code": ev_code_by_id.get(p.event_id, ""),
                 "qr_token": p.qr_token,
                 "holder_name": p.holder_name,
+                "holder_phone": p.holder_phone,
+                "holder_id_number": p.holder_id_number,
+                "organization": p.organization,
+                "vehicle_plate": p.vehicle_plate,
                 "pass_type": p.pass_type,
+                "clearance_category": p.clearance_category,
+                "clearance_status": p.clearance_status,
+                "remarks": p.remarks,
                 "is_checked_in": p.is_checked_in,
                 "checked_in_at": p.checked_in_at.isoformat() if p.checked_in_at else None,
             }
@@ -155,6 +171,8 @@ async def process_offline_batch(
                 ).scalar_one_or_none()
                 if not gp:
                     res_status = "INVALID"
+                elif (gp.clearance_status or "APPROVED") != "APPROVED":
+                    res_status = f"CLEARANCE_{gp.clearance_status}"
                 elif gp.is_checked_in:
                     res_status = "ALREADY_CHECKED_IN"
                 else:

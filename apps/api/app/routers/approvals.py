@@ -1,6 +1,6 @@
 import uuid
 from decimal import Decimal
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -23,7 +23,7 @@ class CreateDraftBody(BaseModel):
 
 
 class ResolveApprovalBody(BaseModel):
-    decision: ApprovalStatus
+    decision: Literal["APPROVED", "REJECTED", "RETURNED_FOR_AMENDMENT"]
     rejection_reason: Optional[str] = None
 
 

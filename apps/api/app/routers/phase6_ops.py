@@ -1,17 +1,19 @@
+import urllib.parse
 import uuid
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import AuthContext, get_current_auth, require_roles, verify_event_access, verify_whatsapp_signature
 from app.models.accounting import ChartOfAccount, Invoice, JournalEntry
-from app.models.events import DraftStatus, DraftType, Event, EventDraft, EventMessage, GatePass
+from app.models.events import AuditLog, DraftStatus, DraftType, Event, EventDraft, EventMessage, GatePass
+from app.models.events_extensions import NotificationLog
 from app.models.users import StaffRole, User, UserType
 from app.models.venue import EventInventoryAllocation, Hall, InventoryItem
 from app.services.accounting_service import DoubleEntryService
@@ -28,6 +30,15 @@ class PostEventMessageBody(BaseModel):
     is_internal: bool = False
 
 
+class ShareDocumentBody(BaseModel):
+    document_type: Literal["INVOICE", "CONTRACT", "DEPOSIT_SETTLEMENT", "BEO"]
+    channel: Literal["WHATSAPP", "EMAIL", "IN_APP"] = "WHATSAPP"
+    recipient_phone: Optional[str] = None
+    recipient_email: Optional[str] = None
+    locale: Literal["ar", "en"] = "ar"
+    message_note: Optional[str] = None
+
+
 @router.post("/import/{entity_type}")
 async def bulk_import_csv(
     entity_type: str,
@@ -40,8 +51,8 @@ async def bulk_import_csv(
         raise HTTPException(status_code=400, detail="Tenant context required")
     raw = await file.read()
     if entity_type == "accounts":
-        if auth.staff_role not in (StaffRole.OWNER, StaffRole.FINANCE) and auth.user.user_type != UserType.SUPER_ADMIN:
-            raise HTTPException(status_code=403, detail="Only OWNER or FINANCE may import Chart of Accounts")
+        if auth.staff_role not in (StaffRole.OWNER, StaffRole.ADMIN, StaffRole.FINANCE) and auth.user.user_type != UserType.SUPER_ADMIN:
+            raise HTTPException(status_code=403, detail="Only OWNER, ADMIN, or FINANCE may import Chart of Accounts")
         return await ImportExportService.import_chart_of_accounts_csv(db, auth.tenant_id, raw)
     if entity_type == "inventory":
         if auth.staff_role not in (StaffRole.OWNER, StaffRole.OPS_MANAGER, StaffRole.FINANCE) and auth.user.user_type != UserType.SUPER_ADMIN:
@@ -163,12 +174,237 @@ async def export_beo_pdf(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    ev = (
+        await db.execute(select(Event.id).where(Event.id == event_id, Event.tenant_id == auth.tenant_id))
+    ).scalar_one_or_none()
+    if not ev:
+        raise HTTPException(status_code=404, detail="Event not found")
     pdf_bytes = await ImportExportService.render_beo_pdf(db, auth.tenant_id, event_id, locale)
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="beo-{event_id}-{locale}.pdf"'},
     )
+
+
+@router.get("/exports/contracts/{event_id}/pdf")
+async def export_contract_pdf(
+    event_id: uuid.UUID,
+    locale: str = Query(default="ar", pattern="^(ar|en)$"),
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    await verify_event_access(db, auth, event_id)
+    pdf_bytes = await ImportExportService.render_contract_pdf(db, auth.tenant_id, event_id, locale)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="contract-{event_id}-{locale}.pdf"'},
+    )
+
+
+@router.get("/exports/events/{event_id}/deposit-settlement.pdf")
+async def export_deposit_settlement_pdf(
+    event_id: uuid.UUID,
+    locale: str = Query(default="ar", pattern="^(ar|en)$"),
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    await verify_event_access(db, auth, event_id, required_delegate_perm="canViewFinance")
+    pdf_bytes = await ImportExportService.render_deposit_settlement_pdf(db, auth.tenant_id, event_id, locale)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="deposit-settlement-{event_id}-{locale}.pdf"'},
+    )
+
+
+@router.get("/notifications")
+async def list_notifications(
+    limit: int = Query(default=30, ge=1, le=100),
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        return {"unread_count": 0, "items": []}
+
+    q = select(NotificationLog).where(NotificationLog.tenant_id == auth.tenant_id)
+    if auth.user.user_type == UserType.INTERNAL_STAFF or auth.user.user_type == UserType.SUPER_ADMIN:
+        q = q.where(
+            or_(
+                NotificationLog.recipient_user_id == auth.user.id,
+                NotificationLog.recipient_user_id.is_(None),
+                NotificationLog.channel == "WHATSAPP",
+            )
+        )
+    else:
+        q = q.where(NotificationLog.recipient_user_id == auth.user.id)
+
+    rows = (await db.execute(q.order_by(NotificationLog.created_at.desc()).limit(limit))).scalars().all()
+    unread = sum(1 for r in rows if not r.is_read)
+    return {
+        "unread_count": unread,
+        "items": [
+            {
+                "id": str(r.id),
+                "event_id": str(r.event_id) if r.event_id else None,
+                "channel": r.channel,
+                "category": r.category,
+                "title": r.title,
+                "content": r.content,
+                "delivery_status": r.delivery_status,
+                "provider_message_id": r.provider_message_id,
+                "recipient_address": r.recipient_address,
+                "is_read": r.is_read,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(
+    notification_id: uuid.UUID,
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    q = select(NotificationLog).where(
+        NotificationLog.id == notification_id,
+        NotificationLog.tenant_id == auth.tenant_id,
+    )
+    if auth.user.user_type not in (UserType.INTERNAL_STAFF, UserType.SUPER_ADMIN):
+        q = q.where(NotificationLog.recipient_user_id == auth.user.id)
+    row = (await db.execute(q)).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    row.is_read = True
+    await db.commit()
+    return {"status": "READ"}
+
+
+@router.post("/notifications/read-all")
+async def mark_all_notifications_read(
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        return {"status": "OK"}
+    q = select(NotificationLog).where(NotificationLog.tenant_id == auth.tenant_id, NotificationLog.is_read == False)  # noqa: E712
+    if auth.user.user_type in (UserType.INTERNAL_STAFF, UserType.SUPER_ADMIN):
+        q = q.where(
+            or_(
+                NotificationLog.recipient_user_id == auth.user.id,
+                NotificationLog.recipient_user_id.is_(None),
+                NotificationLog.channel == "WHATSAPP",
+            )
+        )
+    else:
+        q = q.where(NotificationLog.recipient_user_id == auth.user.id)
+    rows = (await db.execute(q)).scalars().all()
+    for r in rows:
+        r.is_read = True
+    await db.commit()
+    return {"status": "ALL_READ", "count": len(rows)}
+
+
+@router.post("/events/{event_id}/share-document")
+async def share_event_document(
+    event_id: uuid.UUID,
+    body: ShareDocumentBody,
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    ev = await verify_event_access(db, auth, event_id)
+    client = (await db.execute(select(User).where(User.id == ev.primary_client_id))).scalar_one_or_none()
+    inv = (
+        await db.execute(select(Invoice).where(Invoice.event_id == ev.id, Invoice.tenant_id == auth.tenant_id))
+    ).scalar_one_or_none()
+
+    if body.document_type == "INVOICE":
+        if not inv:
+            raise HTTPException(status_code=404, detail="Invoice not found for event")
+        dl_url = f"/api/v1/exports/invoices/{inv.id}/pdf?locale={body.locale}"
+        doc_title = f"Invoice {inv.invoice_number}" if body.locale == "en" else f"فاتورة {inv.invoice_number}"
+    elif body.document_type == "CONTRACT":
+        dl_url = f"/api/v1/exports/contracts/{ev.id}/pdf?locale={body.locale}"
+        doc_title = f"Contract {ev.event_code}" if body.locale == "en" else f"عقد الفعالية {ev.event_code}"
+    elif body.document_type == "DEPOSIT_SETTLEMENT":
+        dl_url = f"/api/v1/exports/events/{ev.id}/deposit-settlement.pdf?locale={body.locale}"
+        doc_title = f"Deposit Settlement {ev.event_code}" if body.locale == "en" else f"سند تسوية التأمين {ev.event_code}"
+    else:
+        dl_url = f"/api/v1/exports/events/{ev.id}/beo.pdf?locale={body.locale}"
+        doc_title = f"BEO {ev.event_code}" if body.locale == "en" else f"أمر التشغيل BEO {ev.event_code}"
+
+    target_phone = (body.recipient_phone or (client.phone if client else "") or "").strip() or None
+    target_email = (body.recipient_email or (client.email if client else "") or "").strip() or None
+    note = f"\n{body.message_note.strip()}" if body.message_note and body.message_note.strip() else ""
+    msg = (
+        f"{doc_title} — {ev.event_code}\nDownload: {dl_url}{note}"
+        if body.locale == "en"
+        else f"{doc_title} — {ev.event_code}\nرابط المستند: {dl_url}{note}"
+    )
+
+    dispatch = await CommsService.notify_and_whatsapp(
+        db,
+        auth.tenant_id,
+        title=f"مشاركة مستند · {doc_title}",
+        content=msg,
+        category="DOCUMENT_SHARE",
+        event_id=ev.id,
+        recipient_user_id=client.id if client else None,
+        recipient_phone=target_phone,
+        send_whatsapp=(body.channel == "WHATSAPP"),
+        channel=body.channel,
+    )
+    if body.channel == "EMAIL" and target_email:
+        db.add(
+            NotificationLog(
+                tenant_id=auth.tenant_id,
+                event_id=ev.id,
+                recipient_user_id=client.id if client else None,
+                recipient_address=target_email,
+                channel="EMAIL",
+                category="DOCUMENT_SHARE",
+                title=f"Email Dispatch: {doc_title}",
+                content=msg,
+                delivery_status="SIMULATED_FALLBACK",
+                provider_message_id=f"sim-mail-{uuid.uuid4().hex[:10]}",
+                is_read=True,
+            )
+        )
+    db.add(
+        AuditLog(
+            tenant_id=auth.tenant_id,
+            event_id=ev.id,
+            actor_id=auth.user.id,
+            action="DOCUMENT_SHARED",
+            new_value={"document_type": body.document_type, "channel": body.channel, "delivery_status": dispatch["delivery_status"]},
+        )
+    )
+    await db.commit()
+    mailto_url = (
+        f"mailto:{urllib.parse.quote(target_email)}?subject={urllib.parse.quote(doc_title)}&body={urllib.parse.quote(msg)}"
+        if target_email
+        else None
+    )
+    return {
+        "status": "SHARED",
+        "document_type": body.document_type,
+        "channel": body.channel,
+        "delivery_status": dispatch["delivery_status"],
+        "download_url": dl_url,
+        "whatsapp_url": dispatch["whatsapp_url"],
+        "mailto_url": mailto_url,
+    }
 
 
 @router.get("/events/{event_id}/messages")
@@ -300,6 +536,7 @@ async def get_live_beo(
             {
                 "event_id": str(ev.id),
                 "event_code": ev.event_code,
+                "title": ev.title,
                 "event_type": ev.event_type,
                 "hall_name": hall.name if hall else "",
                 "hall_name_ar": hall.name_ar if hall else "",

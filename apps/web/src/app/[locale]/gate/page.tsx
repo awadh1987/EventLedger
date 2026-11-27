@@ -2,12 +2,15 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
-import { CheckCircle2, CloudOff, QrCode, RefreshCw, ScanLine, Search, XCircle } from 'lucide-react';
+import Link from 'next/link';
+import { CheckCircle2, CloudOff, QrCode, RefreshCw, ScanLine, Search, ShieldCheck, XCircle } from 'lucide-react';
 import { AppHeader } from '@/components/layout/AppHeader';
 import { MobileBottomNav } from '@/components/layout/MobileBottomNav';
+import { useAuthSession } from '@/components/providers/auth-provider';
+import { BackButton } from '@/components/ui/BackButton';
 import { ResponsiveDataList } from '@/components/ui/ResponsiveDataList';
 import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
-import { apiFetch } from '@/lib/api';
+import { apiFetch, getAccessToken, tenantPath } from '@/lib/api';
 
 interface QueuedScan {
   mutation_id: string;
@@ -23,6 +26,11 @@ interface ManifestPassRow {
   qr_token: string;
   holder_name: string;
   pass_type: string;
+  clearance_category?: string;
+  clearance_status?: string;
+  organization?: string | null;
+  vehicle_plate?: string | null;
+  remarks?: string | null;
   is_checked_in: boolean;
   checked_in_at?: string | null;
 }
@@ -40,6 +48,7 @@ export default function SecurityGatePage() {
   const params = useParams<{ locale?: string }>();
   const locale: 'ar' | 'en' = params?.locale === 'en' ? 'en' : 'ar';
   const isRtl = locale === 'ar';
+  const { tenantSlug } = useAuthSession();
 
   const [qrToken, setQrToken] = useState('QR-EVT-2026-1001-VIP01');
   const [validationState, setValidationState] = useState<{
@@ -53,6 +62,7 @@ export default function SecurityGatePage() {
   const [passFilter, setPassFilter] = useState<'ALL' | 'VIP_PASS' | 'GUEST_PASS' | 'VENDOR_PASS'>('ALL');
 
   const syncManifest = useCallback(async (silent = false) => {
+    if (!getAccessToken()) return;
     try {
       const man = await apiFetch<{ gate_passes: ManifestPassRow[] }>('/api/v1/sync/manifest');
       localStorage.setItem(MANIFEST_KEY, JSON.stringify(man));
@@ -131,13 +141,17 @@ export default function SecurityGatePage() {
               ? isRtl
                 ? 'تم استخدام هذا التصريح مسبقاً'
                 : 'ALREADY CHECKED IN'
-              : res.result === 'OUTSIDE_WINDOW'
+              : res.result.startsWith('CLEARANCE_')
                 ? isRtl
-                  ? 'خارج نافذة وقت الفعالية'
-                  : 'OUTSIDE VALID WINDOW'
-                : isRtl
-                  ? 'تصريح غير صالح'
-                  : 'INVALID QR PASS',
+                  ? `التصريح غير مصرح به (${res.result})`
+                  : `CLEARANCE BLOCKED (${res.result})`
+                : res.result === 'OUTSIDE_WINDOW'
+                  ? isRtl
+                    ? 'خارج نافذة وقت الفعالية'
+                    : 'OUTSIDE VALID WINDOW'
+                  : isRtl
+                    ? 'تصريح غير صالح'
+                    : 'INVALID QR PASS',
           detail: res.holder_name ? `${res.holder_name} (${res.event_code})` : clean,
         });
       }
@@ -211,10 +225,22 @@ export default function SecurityGatePage() {
       <AppHeader locale={locale} />
 
       <main className="mx-auto max-w-5xl space-y-5 px-4 py-6 sm:px-6">
-        <SpotlightHeading as="h1" className="text-start text-2xl">
-          <QrCode className="me-2 inline h-6 w-6 text-[var(--brand-primary,#D4AF37)]" />
-          {isRtl ? 'بوابة الأمن وفحص تصاريح الدخول' : 'Security Gate QR Check-In & Manifest'}
-        </SpotlightHeading>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <BackButton locale={locale} fallbackHref={tenantPath(locale, tenantSlug, '/erp/dashboard')} />
+            <SpotlightHeading as="h1" className="text-start text-2xl">
+              <QrCode className="me-2 inline h-6 w-6 text-[var(--brand-primary,#D4AF37)]" />
+              {isRtl ? 'بوابة الأمن وفحص تصاريح الدخول' : 'Security Gate QR Check-In & Manifest'}
+            </SpotlightHeading>
+          </div>
+          <Link
+            href={tenantPath(locale, tenantSlug, '/erp/dashboard?tab=SECURITY')}
+            className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 text-xs font-bold text-amber-600 dark:text-amber-300"
+          >
+            <ShieldCheck className="h-4 w-4" />
+            <span>{isRtl ? 'لوحة تحكم الأمن والتصاريح' : 'Security Control Plane'}</span>
+          </Link>
+        </div>
 
         {/* QR Scanner + Instant Green/Red Feedback */}
         <SpotlightCard className="space-y-4 text-start">
@@ -245,13 +271,12 @@ export default function SecurityGatePage() {
 
           {validationState && (
             <div
-              className={`flex items-center gap-3 rounded-xl border p-4 ${
-                validationState.tone === 'GREEN'
-                  ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-600 dark:text-emerald-300'
-                  : validationState.tone === 'RED'
-                    ? 'border-rose-500/50 bg-rose-500/15 text-rose-600 dark:text-rose-300'
-                    : 'border-amber-500/50 bg-amber-500/15 text-amber-600 dark:text-amber-300'
-              }`}
+              className={`flex items-center gap-3 rounded-xl border p-4 ${validationState.tone === 'GREEN'
+                ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-600 dark:text-emerald-300'
+                : validationState.tone === 'RED'
+                  ? 'border-rose-500/50 bg-rose-500/15 text-rose-600 dark:text-rose-300'
+                  : 'border-amber-500/50 bg-amber-500/15 text-amber-600 dark:text-amber-300'
+                }`}
             >
               {validationState.tone === 'RED' ? (
                 <XCircle className="h-6 w-6 shrink-0" />
@@ -308,11 +333,10 @@ export default function SecurityGatePage() {
                   key={tier}
                   type="button"
                   onClick={() => setPassFilter(tier)}
-                  className={`rounded-lg px-3 py-1.5 font-bold ${
-                    passFilter === tier
-                      ? 'bg-[var(--brand-primary,#D4AF37)] text-slate-950'
-                      : 'border border-slate-300 dark:border-slate-700'
-                  }`}
+                  className={`rounded-lg px-3 py-1.5 font-bold ${passFilter === tier
+                    ? 'bg-[var(--brand-primary,#D4AF37)] text-slate-950'
+                    : 'border border-slate-300 dark:border-slate-700'
+                    }`}
                 >
                   {tier === 'ALL' ? (isRtl ? 'الكل' : 'All') : badgeLabel(tier)}
                 </button>
@@ -337,18 +361,34 @@ export default function SecurityGatePage() {
             columns={[
               {
                 key: 'holder',
-                headerAr: 'الاسم',
-                headerEn: 'Holder',
-                render: (r) => <span className="font-semibold">{r.holder_name}</span>,
+                headerAr: 'الاسم والجهة',
+                headerEn: 'Holder & Org',
+                render: (r) => (
+                  <div>
+                    <div className="font-semibold">{r.holder_name}</div>
+                    {(r.organization || r.vehicle_plate) && (
+                      <div className="text-[11px] text-slate-500">
+                        {r.organization || ''} {r.vehicle_plate ? `· [${r.vehicle_plate}]` : ''}
+                      </div>
+                    )}
+                  </div>
+                ),
               },
               {
                 key: 'badge',
                 headerAr: 'الفئة',
                 headerEn: 'Type',
                 render: (r) => (
-                  <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-bold ${PASS_BADGE[r.pass_type] || PASS_BADGE.GUEST_PASS}`}>
-                    {badgeLabel(r.pass_type)}
-                  </span>
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-bold ${PASS_BADGE[r.pass_type] || PASS_BADGE.GUEST_PASS}`}>
+                      {r.clearance_category || badgeLabel(r.pass_type)}
+                    </span>
+                    {r.clearance_status && r.clearance_status !== 'APPROVED' && (
+                      <span className="rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-bold text-rose-500">
+                        {r.clearance_status}
+                      </span>
+                    )}
+                  </div>
                 ),
               },
               {
@@ -363,11 +403,10 @@ export default function SecurityGatePage() {
                 headerEn: 'Status',
                 render: (r) => (
                   <span
-                    className={`rounded-full px-2.5 py-0.5 text-[11px] font-bold ${
-                      r.is_checked_in
-                        ? 'bg-emerald-500/20 text-emerald-500'
-                        : 'bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
-                    }`}
+                    className={`rounded-full px-2.5 py-0.5 text-[11px] font-bold ${r.is_checked_in
+                      ? 'bg-emerald-500/20 text-emerald-500'
+                      : 'bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
+                      }`}
                   >
                     {r.is_checked_in ? (isRtl ? 'تم الدخول ✓' : 'Checked In ✓') : isRtl ? 'بانتظار الوصول' : 'Pending'}
                   </span>

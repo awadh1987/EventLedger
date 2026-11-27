@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { FileDown, RefreshCw, Send, UtensilsCrossed } from 'lucide-react';
-import { apiFetch, downloadAuthorizedFile } from '@/lib/api';
+import { apiFetch, downloadAuthorizedFile, getAccessToken } from '@/lib/api';
 import { AppHeader } from '@/components/layout/AppHeader';
 import { MobileBottomNav } from '@/components/layout/MobileBottomNav';
 import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
@@ -30,6 +30,7 @@ export default function LiveBeoPage() {
   const [noteByEvent, setNoteByEvent] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
+    if (!getAccessToken()) return;
     try {
       const res = await apiFetch<{ orders: BeoOrder[] }>('/api/v1/ops/beo');
       setOrders(res.orders || []);

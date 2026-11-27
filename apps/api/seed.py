@@ -28,6 +28,7 @@ from app.models.events_extensions import (  # noqa: F401
     InspectionStatus,
     RsvpStatus,
 )
+import app.models.governance  # noqa: F401
 from app.models.tenant import SubscriptionStatus, SubscriptionTier, Tenant, TenantBranding
 from app.models.users import (
     ClientCategory,

@@ -3,7 +3,7 @@
 import React, { useRef, useState } from 'react';
 import { useTenantBranding } from '@/components/providers/theme-branding-provider';
 
-export function SpotlightCard({ children, className = '', ...props }: React.HTMLAttributes<HTMLDivElement>) {
+export function SpotlightCard({ children, className = '', style, ...props }: React.HTMLAttributes<HTMLDivElement>) {
   const ref = useRef<HTMLDivElement>(null);
   const branding = useTenantBranding();
   const [coords, setCoords] = useState({ x: 0, y: 0 });
@@ -24,15 +24,22 @@ export function SpotlightCard({ children, className = '', ...props }: React.HTML
       onMouseLeave={() => setActive(false)}
       onPointerDown={(e) => update(e.clientX, e.clientY)}
       onTouchStart={(e) => e.touches[0] && update(e.touches[0].clientX, e.touches[0].clientY)}
-      className={`relative overflow-hidden rounded-xl border border-slate-200/80 bg-white/90 p-5 shadow-sm transition-all duration-300 dark:border-slate-800 dark:bg-slate-900/90 ${
-        active && branding.enableSpotlight ? 'border-[var(--brand-primary,#D4AF37)] shadow-md' : ''
+      className={`relative overflow-hidden border p-5 shadow-sm transition-all duration-300 ${
+        active && branding.enableSpotlight ? 'shadow-md' : ''
       } ${className}`}
+      style={{
+        borderRadius: 'var(--brand-radius, 0.75rem)',
+        backgroundColor: 'var(--card-bg)',
+        borderColor: active && branding.enableSpotlight ? 'var(--brand-primary, #D4AF37)' : 'var(--card-border)',
+        ...style,
+      }}
       {...props}
     >
       {branding.enableSpotlight && (
         <div
-          className="pointer-events-none absolute -inset-px rounded-xl transition-opacity duration-300"
+          className="pointer-events-none absolute -inset-px transition-opacity duration-300"
           style={{
+            borderRadius: 'inherit',
             opacity: active ? 1 : 0,
             background: `radial-gradient(420px circle at ${coords.x}px ${coords.y}px, var(--brand-glow, ${branding.spotlightColor}), transparent 75%)`,
           }}

@@ -10,6 +10,7 @@ _TEST_DB = os.path.join(tempfile.gettempdir(), "eventledger_test.db")
 if os.path.exists(_TEST_DB):
     os.remove(_TEST_DB)
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TEST_DB}"
+os.environ["APP_ENV"] = "test"
 os.environ["DEBUG"] = "true"
 
 import pytest
@@ -57,6 +58,7 @@ class TestDoubleEntryAndEncodingInvariants(unittest.TestCase):
 
 @pytest.mark.asyncio
 async def test_end_to_end_api_invariants():
+    assert "sqlite" in str(engine.url), f"Refusing destructive reset on non-SQLite DB: {engine.url}"
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)

@@ -123,8 +123,9 @@ function ClientPortalLoginInner() {
       );
       return false;
     }
-    loginSession(token, user, effectiveSlug);
-    router.push(tenantPath(locale, effectiveSlug, '/portal/dashboard'));
+    const targetSlug = user.tenant_slug || effectiveSlug;
+    loginSession(token, user, targetSlug);
+    router.push(tenantPath(locale, targetSlug, '/portal/dashboard'));
     return true;
   };
 
@@ -261,6 +262,7 @@ function ClientPortalLoginInner() {
                 }}
                 className={inputCls}
               >
+                <option value="">{tr('دخول موحد عبر إيفنت ليدجر (تلقائي)', 'Unified EventLedger Sign In (Auto-Detect)')}</option>
                 {venues.map((v) => (
                   <option key={v.slug} value={v.slug}>
                     {v.name} (/{v.slug})

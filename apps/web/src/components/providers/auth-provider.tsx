@@ -95,6 +95,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const me = await apiFetch<AuthUser>('/api/v1/auth/me');
       setUser(me);
+      const hasPathSlug = /^\/(?:(?:ar|en)\/)?t\/([a-z0-9-]+)/i.test(pathname);
+      if (me.tenant_slug && !hasPathSlug) {
+        setTenantSlug(me.tenant_slug);
+        setTenantSlugState(me.tenant_slug);
+      }
       if (typeof window !== 'undefined') {
         localStorage.setItem(USER_CACHE_KEY, JSON.stringify(me));
       }
@@ -107,7 +112,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [pathname]);
 
   useEffect(() => {
     refreshUser();
@@ -125,7 +130,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       localStorage.setItem(USER_CACHE_KEY, JSON.stringify(nextUser));
     }
     setUser(nextUser);
-  }, []);
+  }, [pathname]);
 
   const switchWorkspace = useCallback(
     (nextSlug: string, locale?: string) => {
@@ -153,16 +158,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(
     (redirectLocale?: string) => {
+      const currentPath = typeof window !== 'undefined' ? window.location.pathname : pathname;
+      const detectedLocale = redirectLocale || currentPath.match(/^\/(ar|en)(?=\/|$)/)?.[1] || 'ar';
+      const pathSlug = currentPath.match(/^\/(?:(?:ar|en)\/)?t\/([a-z0-9-]+)/i)?.[1]?.toLowerCase() || '';
+      const wasStaff = user?.user_type === 'INTERNAL_STAFF';
       clearAuthStorage();
       setUser(null);
+      if (pathSlug) {
+        setTenantSlug(pathSlug);
+        setTenantSlugState(pathSlug);
+        router.push(`/${detectedLocale}/t/${pathSlug}/${wasStaff ? 'staff-login' : 'portal/login'}`);
+        return;
+      }
       setTenantSlugState('');
-      const detectedLocale =
-        redirectLocale ||
-        (typeof window !== 'undefined' ? window.location.pathname.match(/^\/(ar|en)(?=\/|$)/)?.[1] : undefined) ||
-        'ar';
       router.push(`/${detectedLocale}/login`);
     },
-    [router]
+    [pathname, router, user?.user_type]
   );
 
   return (

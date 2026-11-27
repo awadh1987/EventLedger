@@ -10,12 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import AuthContext, get_current_auth, require_roles, verify_event_access
-from app.models.accounting import AccountingConfig, DepositStatus, Invoice
+from app.models.accounting import AccountingConfig, DepositStatus, Invoice, JournalEntry
 from app.models.base import utcnow
 from app.models.events import AuditLog, Event, EventStatus, GatePass
 from app.models.events_extensions import DamageInspection, EventContract, EventGuest, InspectionStatus, RsvpStatus
-from app.models.users import StaffRole, UserType
+from app.models.users import StaffRole, User, UserType
 from app.services.accounting_service import DoubleEntryService
+from app.services.comms_service import CommsService
 
 router = APIRouter(prefix="/api/v1", tags=["Tier 2: Contracts, Guests, Receipt Verify & Deposit Vault"])
 
@@ -41,8 +42,11 @@ class VerifyMilestoneBody(BaseModel):
 class DamageInspectionBody(BaseModel):
     status: InspectionStatus
     deduction_amount: Decimal = Decimal("0.00")
+    deduction_items: list[dict] = []
     notes: Optional[str] = None
+    amendment_remarks: Optional[str] = None
     checklist_json: dict = {}
+    workflow_action: str = "FINALIZE"
 
 
 @router.get("/portal/events/{event_id}/contract")
@@ -70,12 +74,16 @@ async def get_event_contract(
         "id": str(contract.id),
         "event_id": str(contract.event_id),
         "contract_number": contract.contract_number,
+        "status": getattr(contract, "status", "DRAFT") or "DRAFT",
         "terms_ar": contract.terms_ar,
         "terms_en": contract.terms_en,
+        "remarks": getattr(contract, "remarks", None),
+        "amendment_remarks": getattr(contract, "amendment_remarks", None),
+        "ai_metadata_json": getattr(contract, "ai_metadata_json", None),
         "client_signed_at": contract.client_signed_at.isoformat() if contract.client_signed_at else None,
         "client_signature_name": contract.client_signature_name,
         "staff_countersigned_at": contract.staff_countersigned_at.isoformat() if contract.staff_countersigned_at else None,
-        "pdf_url": contract.pdf_url,
+        "pdf_url": contract.pdf_url or f"/api/v1/exports/contracts/{contract.event_id}/pdf",
     }
 
 
@@ -105,6 +113,7 @@ async def sign_event_contract(
     contract.client_signed_at = utcnow()
     contract.client_signature_name = body.signature_name.strip()
     contract.client_signature_ip = request.client.host if request.client else "unknown"
+    contract.status = "SIGNED"
 
     db.add(
         AuditLog(
@@ -114,6 +123,16 @@ async def sign_event_contract(
             action="CONTRACT_ESIGNED_BY_CLIENT",
             new_value={"contract_number": contract.contract_number, "signed_by": contract.client_signature_name},
         )
+    )
+    await CommsService.notify_and_whatsapp(
+        db,
+        auth.tenant_id,
+        title=f"تم توقيع العقد إلكترونياً · {contract.contract_number}",
+        content=f"وقّع العميل {contract.client_signature_name} العقد {contract.contract_number}.",
+        category="STATUS_UPDATE",
+        event_id=event_id,
+        recipient_user_id=None,
+        send_whatsapp=False,
     )
     await db.commit()
     return {
@@ -202,12 +221,14 @@ async def add_guest_with_qr_pass(
 async def verify_payment_milestone(
     milestone_id: uuid.UUID,
     body: VerifyMilestoneBody,
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE})),
+    auth: AuthContext = Depends(
+        require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.ADMIN, StaffRole.FINANCE})
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
-    return await DoubleEntryService.verify_milestone_payment(
+    res = await DoubleEntryService.verify_milestone_payment(
         db=db,
         tenant_id=auth.tenant_id,
         user_id=auth.user.id,
@@ -216,13 +237,19 @@ async def verify_payment_milestone(
         is_security_deposit=body.is_security_deposit,
         reference=body.reference,
     )
+    return res
 
 
 @router.post("/erp/ops/events/{event_id}/inspection")
 async def submit_damage_inspection(
     event_id: uuid.UUID,
     body: DamageInspectionBody,
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.OPS_MANAGER})),
+    auth: AuthContext = Depends(
+        require_roles(
+            {UserType.INTERNAL_STAFF},
+            {StaffRole.OWNER, StaffRole.ADMIN, StaffRole.OPS_MANAGER, StaffRole.FINANCE, StaffRole.SECURITY},
+        )
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
@@ -234,7 +261,16 @@ async def submit_damage_inspection(
     if not ev:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    deduction = Decimal(str(body.deduction_amount)).quantize(Decimal("0.01"))
+    raw_ded = Decimal(str(body.deduction_amount)).quantize(Decimal("0.01"))
+    if raw_ded <= Decimal("0.00") and body.deduction_items:
+        item_sum = sum(
+            (Decimal(str(it.get("amount", 0) or 0)) for it in body.deduction_items if isinstance(it, dict)),
+            Decimal("0.00"),
+        )
+        deduction = item_sum.quantize(Decimal("0.01"))
+    else:
+        deduction = raw_ded
+
     if deduction < Decimal("0.00"):
         raise HTTPException(status_code=400, detail="deduction_amount cannot be negative")
 
@@ -246,54 +282,13 @@ async def submit_damage_inspection(
         )
     ).scalar_one_or_none()
 
-    if inv:
-        if body.status == InspectionStatus.DAMAGE_CLAIMED and deduction > Decimal("0.00"):
-            if deduction > Decimal(str(inv.security_deposit_amount)):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Deduction amount cannot exceed held security deposit amount",
-                )
-            cfg = (
-                await db.execute(select(AccountingConfig).where(AccountingConfig.tenant_id == auth.tenant_id))
-            ).scalar_one_or_none()
-            if not cfg or not cfg.security_deposit_liab_id:
-                raise HTTPException(status_code=400, detail="AccountingConfig missing security deposit account")
-            recovery_acc = cfg.damage_recovery_account_id or cfg.hall_revenue_account_id
-            if not recovery_acc:
-                raise HTTPException(status_code=400, detail="AccountingConfig missing damage recovery revenue account")
+    if inv and body.status == InspectionStatus.DAMAGE_CLAIMED and deduction > Decimal(str(inv.security_deposit_amount)):
+        raise HTTPException(
+            status_code=400,
+            detail="Deduction amount cannot exceed held security deposit amount",
+        )
 
-            await DoubleEntryService.post_balanced_entry(
-                db=db,
-                tenant_id=auth.tenant_id,
-                created_by_id=auth.user.id,
-                reference=f"DMG-{inv.invoice_number}",
-                description=f"Post-event damage deduction for {ev.event_code}",
-                event_id=event_id,
-                is_system_posting=True,
-                idempotency_key=f"DAMAGE_DEDUCT:{event_id}",
-                lines=[
-                    {
-                        "account_id": cfg.security_deposit_liab_id,
-                        "debit": deduction,
-                        "credit": Decimal("0.00"),
-                        "memo": "Deduct damage claim from security deposit 2100",
-                    },
-                    {
-                        "account_id": recovery_acc,
-                        "debit": Decimal("0.00"),
-                        "credit": deduction,
-                        "memo": "Damage recovery revenue",
-                    },
-                ],
-            )
-            inv.deposit_status = DepositStatus.DEDUCTED
-        else:
-            inv.deposit_status = (
-                DepositStatus.INSPECTION_PASSED if body.status == InspectionStatus.PASSED else DepositStatus.DEDUCTED
-            )
-
-    ev.status = EventStatus.COMPLETED
-
+    action_mode = (body.workflow_action or "FINALIZE").strip().upper()
     inspection = (
         await db.execute(
             select(DamageInspection).where(
@@ -305,8 +300,11 @@ async def submit_damage_inspection(
     if inspection:
         inspection.inspected_by_id = auth.user.id
         inspection.checklist_json = body.checklist_json
+        inspection.deduction_items_json = body.deduction_items
         inspection.deduction_amount = deduction
         inspection.notes = body.notes
+        if body.amendment_remarks is not None:
+            inspection.amendment_remarks = body.amendment_remarks
         inspection.status = body.status
         inspection.inspected_at = utcnow()
     else:
@@ -315,11 +313,96 @@ async def submit_damage_inspection(
             event_id=event_id,
             inspected_by_id=auth.user.id,
             checklist_json=body.checklist_json,
+            deduction_items_json=body.deduction_items,
             deduction_amount=deduction,
             notes=body.notes,
+            amendment_remarks=body.amendment_remarks,
             status=body.status,
+            approval_status="FINALIZED" if action_mode == "FINALIZE" else "DRAFT",
         )
         db.add(inspection)
+
+    if action_mode != "FINALIZE":
+        if action_mode == "SUBMIT_FOR_CLIENT_REVIEW":
+            inspection.approval_status = "PENDING_CLIENT_REVIEW"
+        elif action_mode == "RETURN_FOR_AMENDMENT":
+            inspection.approval_status = "RETURNED_FOR_AMENDMENT"
+        else:
+            inspection.approval_status = "DRAFT"
+        db.add(
+            AuditLog(
+                tenant_id=auth.tenant_id,
+                event_id=event_id,
+                actor_id=auth.user.id,
+                action="POST_EVENT_INSPECTION_SAVED",
+                new_value={
+                    "status": body.status.value,
+                    "approval_status": inspection.approval_status,
+                    "deduction_amount": float(deduction),
+                },
+            )
+        )
+        await db.commit()
+        return {
+            "status": body.status.value,
+            "approval_status": inspection.approval_status,
+            "deposit_status": inv.deposit_status.value if inv else None,
+            "deduction_amount": float(deduction),
+        }
+
+    inspection.approval_status = "FINALIZED"
+    if inv:
+        if body.status == InspectionStatus.DAMAGE_CLAIMED and deduction > Decimal("0.00"):
+            existing_je = (
+                await db.execute(
+                    select(JournalEntry.id).where(
+                        JournalEntry.tenant_id == auth.tenant_id,
+                        JournalEntry.idempotency_key == f"DAMAGE_DEDUCT:{event_id}",
+                    )
+                )
+            ).scalar_one_or_none()
+            if not existing_je:
+                cfg = (
+                    await db.execute(select(AccountingConfig).where(AccountingConfig.tenant_id == auth.tenant_id))
+                ).scalar_one_or_none()
+                if not cfg or not cfg.security_deposit_liab_id:
+                    raise HTTPException(status_code=400, detail="AccountingConfig missing security deposit account")
+                recovery_acc = cfg.damage_recovery_account_id or cfg.hall_revenue_account_id
+                if not recovery_acc:
+                    raise HTTPException(status_code=400, detail="AccountingConfig missing damage recovery revenue account")
+
+                await DoubleEntryService.post_balanced_entry(
+                    db=db,
+                    tenant_id=auth.tenant_id,
+                    created_by_id=auth.user.id,
+                    reference=f"DMG-{inv.invoice_number}",
+                    description=f"Post-event damage deduction for {ev.event_code}",
+                    event_id=event_id,
+                    is_system_posting=True,
+                    idempotency_key=f"DAMAGE_DEDUCT:{event_id}",
+                    lines=[
+                        {
+                            "account_id": cfg.security_deposit_liab_id,
+                            "debit": deduction,
+                            "credit": Decimal("0.00"),
+                            "memo": "Deduct damage claim from security deposit 2100",
+                        },
+                        {
+                            "account_id": recovery_acc,
+                            "debit": Decimal("0.00"),
+                            "credit": deduction,
+                            "memo": "Damage recovery revenue",
+                        },
+                    ],
+                )
+            inv.deposit_status = DepositStatus.DEDUCTED
+        else:
+            inv.deposit_status = (
+                DepositStatus.INSPECTION_PASSED if body.status == InspectionStatus.PASSED else DepositStatus.DEDUCTED
+            )
+
+    if ev.status != EventStatus.CLOSED:
+        ev.status = EventStatus.COMPLETED
 
     db.add(
         AuditLog(
@@ -327,8 +410,30 @@ async def submit_damage_inspection(
             event_id=event_id,
             actor_id=auth.user.id,
             action="POST_EVENT_DAMAGE_INSPECTION",
-            new_value={"status": body.status.value, "deduction_amount": float(deduction)},
+            new_value={
+                "status": body.status.value,
+                "approval_status": "FINALIZED",
+                "deduction_amount": float(deduction),
+            },
         )
     )
+    client = (await db.execute(select(User).where(User.id == ev.primary_client_id))).scalar_one_or_none()
+    if client:
+        await CommsService.notify_and_whatsapp(
+            db,
+            auth.tenant_id,
+            title=f"اعتماد فحص ما بعد الفعالية · {ev.event_code}",
+            content=f"تم اعتماد تقرير الفحص للفعالية {ev.event_code} ({body.status.value}) — إجمالي الخصم: {deduction:,.2f}.",
+            category="DEPOSIT_INSPECTION",
+            event_id=ev.id,
+            recipient_user_id=client.id,
+            recipient_phone=client.phone,
+            send_whatsapp=True,
+        )
     await db.commit()
-    return {"status": body.status.value, "deposit_status": inv.deposit_status.value if inv else None}
+    return {
+        "status": body.status.value,
+        "approval_status": inspection.approval_status,
+        "deposit_status": inv.deposit_status.value if inv else None,
+        "deduction_amount": float(deduction),
+    }

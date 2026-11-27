@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TenantOwnedMixin, UUIDPkMixin, utcnow
@@ -16,6 +16,7 @@ class EventStatus(str, enum.Enum):
     CONTRACT_PENDING = "CONTRACT_PENDING"
     CONFIRMED = "CONFIRMED"
     COMPLETED = "COMPLETED"
+    CLOSED = "CLOSED"
     CANCELLED = "CANCELLED"
 
 
@@ -43,17 +44,23 @@ class ApprovalStatus(str, enum.Enum):
 
 class Event(UUIDPkMixin, TenantOwnedMixin, Base):
     __tablename__ = "events"
+    __table_args__ = (UniqueConstraint("tenant_id", "event_code", name="uq_events_tenant_code"),)
 
     hall_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("halls.id"))
     primary_client_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     assigned_sales_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"), nullable=True)
-    event_code: Mapped[str] = mapped_column(String(50), unique=True)
+    event_code: Mapped[str] = mapped_column(String(50), index=True)
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     event_type: Mapped[str] = mapped_column(String(50))
     start_time: Mapped[datetime] = mapped_column(DateTime)
     end_time: Mapped[datetime] = mapped_column(DateTime)
     status: Mapped[EventStatus] = mapped_column(Enum(EventStatus), default=EventStatus.INQUIRY)
     guest_count: Mapped[int] = mapped_column(Integer)
     is_locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    closed_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    closing_remarks: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reopened_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -103,8 +110,16 @@ class GatePass(UUIDPkMixin, TenantOwnedMixin, Base):
 
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"), index=True)
     pass_type: Mapped[str] = mapped_column(String(40))
+    clearance_category: Mapped[str] = mapped_column(String(40), default="GUEST")
     holder_name: Mapped[str] = mapped_column(String(255))
+    holder_phone: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     holder_id_number: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    organization: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    vehicle_plate: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    clearance_status: Mapped[str] = mapped_column(String(40), default="APPROVED")
+    remarks: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    requested_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"), nullable=True)
     qr_token: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     valid_from: Mapped[datetime] = mapped_column(DateTime)
     valid_until: Mapped[datetime] = mapped_column(DateTime)

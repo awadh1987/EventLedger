@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import AuthContext, get_current_auth, require_roles
+from app.core.tenant_middleware import resolve_active_tenant_by_slug
+from app.models.base import RecordLifecycle
 from app.models.tenant import Tenant, TenantBranding
 from app.models.users import StaffRole, User, UserType
 from app.models.venue import Hall
@@ -23,12 +25,14 @@ ALLOWED_TYPES = ALLOWED_IMAGE_TYPES | ALLOWED_VIDEO_TYPES
 
 STAFF_MEDIA_ROLES = {
     StaffRole.OWNER,
+    StaffRole.ADMIN,
     StaffRole.SALES_MANAGER,
     StaffRole.SALES_REP,
+    StaffRole.SALES,
     StaffRole.FINANCE,
     StaffRole.OPS_MANAGER,
 }
-ADMIN_MEDIA_ROLES = {StaffRole.OWNER, StaffRole.SALES_MANAGER, StaffRole.OPS_MANAGER}
+ADMIN_MEDIA_ROLES = {StaffRole.OWNER, StaffRole.ADMIN, StaffRole.SALES_MANAGER, StaffRole.OPS_MANAGER}
 
 
 def _safe_filename(original: str) -> str:
@@ -60,9 +64,7 @@ async def _resolve_tenant(
         if host.endswith(".events-ye.services"):
             slug = host.replace(".events-ye.services", "")
 
-    tenant = (
-        await db.execute(select(Tenant).where(Tenant.slug == slug))
-    ).scalar_one_or_none()
+    tenant = await resolve_active_tenant_by_slug(db, slug)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
     return tenant
@@ -93,7 +95,9 @@ async def upload_media_file(
     file: UploadFile = File(...),
     folder: str = Form(default="general"),
     db: AsyncSession = Depends(get_db),
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, STAFF_MEDIA_ROLES)),
+    auth: AuthContext = Depends(
+        require_roles({UserType.INTERNAL_STAFF}, STAFF_MEDIA_ROLES, required_perm=("branding", "edit"))
+    ),
 ):
     content_type = (file.content_type or "").lower()
     if content_type not in ALLOWED_TYPES:
@@ -116,7 +120,7 @@ async def upload_media_file(
                 raise HTTPException(status_code=413, detail="File exceeds 100MB limit")
             out.write(chunk)
 
-    public_url = f"https://{tenant.slug}.events-ye.services/media/{tenant.slug}/{safe_folder}/{filename}"
+    public_url = f"/media/{tenant.slug}/{safe_folder}/{filename}"
     media_type = "video" if content_type in ALLOWED_VIDEO_TYPES else "image"
     return {
         "url": public_url,
@@ -131,7 +135,9 @@ async def update_profile_and_brand_media(
     payload: ProfileMediaUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, ADMIN_MEDIA_ROLES)),
+    auth: AuthContext = Depends(
+        require_roles({UserType.INTERNAL_STAFF}, ADMIN_MEDIA_ROLES, required_perm=("branding", "edit"))
+    ),
 ):
     tenant = await _resolve_tenant(request, db, auth)
     branding = (
@@ -171,7 +177,9 @@ async def update_hall_media(
     payload: HallMediaUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, STAFF_MEDIA_ROLES)),
+    auth: AuthContext = Depends(
+        require_roles({UserType.INTERNAL_STAFF}, STAFF_MEDIA_ROLES, required_perm=("branding", "edit"))
+    ),
 ):
     tenant = await _resolve_tenant(request, db, auth)
     hall = (
@@ -182,13 +190,17 @@ async def update_hall_media(
 
     settings = dict(tenant.settings or {})
     hall_media_map: dict[str, Any] = dict(settings.get("hall_media") or {})
-    hall_media_map[str(hall.id)] = {
-        "hall_id": str(hall.id),
-        "hall_name": hall.name,
-        "hall_name_ar": hall.name_ar,
-        "cover_image_url": payload.cover_image_url,
-        "items": [item.model_dump() for item in payload.items],
-    }
+    existing_hm = dict(hall_media_map.get(str(hall.id)) or {})
+    existing_hm.update(
+        {
+            "hall_id": str(hall.id),
+            "hall_name": hall.name,
+            "hall_name_ar": hall.name_ar,
+            "cover_image_url": payload.cover_image_url,
+            "items": [item.model_dump() for item in payload.items],
+        }
+    )
+    hall_media_map[str(hall.id)] = existing_hm
     settings["hall_media"] = hall_media_map
     tenant.settings = settings
     await db.commit()
@@ -204,7 +216,11 @@ async def get_public_venue_media(
     branding = (
         await db.execute(select(TenantBranding).where(TenantBranding.tenant_id == tenant.id))
     ).scalar_one_or_none()
-    halls = (await db.execute(select(Hall).where(Hall.tenant_id == tenant.id))).scalars().all()
+    halls = (
+        await db.execute(
+            select(Hall).where(Hall.tenant_id == tenant.id, Hall.lifecycle == RecordLifecycle.ACTIVE)
+        )
+    ).scalars().all()
     settings = dict(tenant.settings or {})
     hall_media_map = settings.get("hall_media") or {}
     profile_media = settings.get("profile_media") or {}

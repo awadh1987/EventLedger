@@ -19,6 +19,7 @@ from app.models.accounting import (
     EventExpense,
     FiscalYear,
     Invoice,
+    InvoiceStatus,
     JournalEntry,
     JournalLine,
     NormalBalance,
@@ -29,10 +30,15 @@ from app.models.accounting import (
 from app.models.base import RecordLifecycle
 from app.models.events import AuditLog, Event
 from app.models.events_extensions import DamageInspection, InspectionStatus
-from app.models.users import StaffRole, User, UserType
+from app.models.tenant import Tenant
+from app.models.users import StaffProfile, StaffRole, User, UserType
+from app.models.venue import Hall
 from app.services.accounting_service import DoubleEntryService
+from app.services.availability_service import AvailabilityService
+from app.services.comms_service import CommsService
 
 router = APIRouter(prefix="/api/v1", tags=["Double-Entry Accounting & Finance"])
+FINANCE_WRITE_ROLES = {StaffRole.OWNER, StaffRole.ADMIN, StaffRole.FINANCE}
 
 
 class CreateAccountBody(BaseModel):
@@ -88,6 +94,16 @@ class PatchPeriodBody(BaseModel):
 class RefundDepositBody(BaseModel):
     payment_method: str = "KURAIMI_BANK"
     reference: str = "Security Deposit Refund"
+    remarks: Optional[str] = None
+
+
+class ReturnMilestoneBody(BaseModel):
+    remarks: str = Field(..., min_length=2, max_length=1000)
+
+
+class AdjustInvoiceDiscountBody(BaseModel):
+    discount_percent: Decimal = Field(..., ge=0, le=100)
+    remarks: Optional[str] = Field(default=None, max_length=500)
 
 
 class CreateEventExpenseBody(BaseModel):
@@ -132,7 +148,7 @@ async def list_chart_of_accounts(
 @router.post("/finance/accounts")
 async def create_account(
     body: CreateAccountBody,
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE})),
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, FINANCE_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
@@ -199,7 +215,7 @@ async def create_account(
 async def update_account(
     account_id: uuid.UUID,
     body: PatchAccountBody,
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE})),
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, FINANCE_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
@@ -293,7 +309,7 @@ async def list_fiscal_years(
 @router.post("/finance/fiscal-years")
 async def create_fiscal_year(
     body: CreateFiscalYearBody,
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE})),
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, FINANCE_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
@@ -307,7 +323,7 @@ async def create_fiscal_year(
 async def update_accounting_period(
     period_id: uuid.UUID,
     body: PatchPeriodBody,
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE})),
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, FINANCE_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
@@ -407,7 +423,7 @@ async def list_journal_entries(
 @router.post("/finance/journal-entries")
 async def post_journal_entry(
     body: PostJournalRequest,
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE})),
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, FINANCE_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
@@ -442,7 +458,7 @@ async def post_journal_entry(
 async def reverse_journal_entry(
     entry_id: uuid.UUID,
     body: ReverseJournalBody = ReverseJournalBody(),
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE})),
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, FINANCE_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
@@ -492,10 +508,15 @@ async def list_invoices(
     users = {
         u.id: u for u in (await db.execute(select(User).where(User.tenant_id == auth.tenant_id))).scalars().all()
     }
+    halls = {
+        h.id: h for h in (await db.execute(select(Hall).where(Hall.tenant_id == auth.tenant_id))).scalars().all()
+    }
+    active_halls = [h for h in halls.values() if h.lifecycle == RecordLifecycle.ACTIVE]
     out = []
     for inv in invoices:
         ev = events.get(inv.event_id)
         client = users.get(ev.primary_client_id) if ev else None
+        ev_hids = AvailabilityService.extract_booked_hall_ids(ev, inv.line_items_json, active_halls) if ev else []
         milestones = (
             await db.execute(
                 select(PaymentMilestone)
@@ -513,12 +534,25 @@ async def list_invoices(
                 "invoice_number": inv.invoice_number,
                 "event_id": str(inv.event_id),
                 "event_code": ev.event_code if ev else "",
+                "event_title": ev.title if ev else None,
+                "hall_ids": [str(hid) for hid in ev_hids],
+                "hall_name": " + ".join(halls[hid].name for hid in ev_hids if hid in halls) or None,
+                "hall_name_ar": " + ".join(halls[hid].name_ar for hid in ev_hids if hid in halls) or None,
                 "client_name": client.full_name if client else "",
+                "client_phone": client.phone if client else None,
+                "subtotal": float(inv.subtotal),
+                "discount_percent": float(getattr(inv, "discount_percent", 0) or 0),
+                "discount_amount": float(inv.discount_amount),
+                "tax_amount": float(inv.tax_amount),
                 "total_amount": float(inv.total_amount),
                 "paid_amount": float(paid_amount),
                 "security_deposit_amount": float(inv.security_deposit_amount),
                 "deposit_status": inv.deposit_status.value,
+                "refund_voucher_number": getattr(inv, "refund_voucher_number", None),
+                "refund_payment_method": getattr(inv, "refund_payment_method", None),
+                "refund_reference": getattr(inv, "refund_reference", None),
                 "status": inv.status.value,
+                "line_items": inv.line_items_json,
                 "milestones": [
                     {
                         "id": str(m.id),
@@ -530,6 +564,7 @@ async def list_invoices(
                         "receipt_url": m.receipt_url,
                         "is_security_deposit": m.is_security_deposit,
                         "status": m.status,
+                        "reviewer_remarks": getattr(m, "reviewer_remarks", None),
                     }
                     for m in milestones
                 ],
@@ -542,7 +577,7 @@ async def list_invoices(
 async def verify_milestone_payment(
     milestone_id: uuid.UUID,
     body: VerifyMilestoneBody,
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE})),
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, FINANCE_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
@@ -554,7 +589,256 @@ async def verify_milestone_payment(
         milestone_id=milestone_id,
         payment_method=body.payment_method,
         is_security_deposit=body.is_security_deposit,
+        reference=body.reference,
     )
+
+
+@router.patch("/erp/finance/milestones/{milestone_id}/return")
+async def return_milestone_for_amendment(
+    milestone_id: uuid.UUID,
+    body: ReturnMilestoneBody,
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, FINANCE_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    ms = (
+        await db.execute(
+            select(PaymentMilestone).where(
+                PaymentMilestone.id == milestone_id,
+                PaymentMilestone.tenant_id == auth.tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if not ms:
+        raise HTTPException(status_code=404, detail="Milestone not found")
+    if ms.status == "PAID":
+        raise HTTPException(status_code=400, detail="Verified PAID milestones cannot be returned for amendment")
+
+    inv = (
+        await db.execute(select(Invoice).where(Invoice.id == ms.invoice_id, Invoice.tenant_id == auth.tenant_id))
+    ).scalar_one_or_none()
+    ev = (
+        (await db.execute(select(Event).where(Event.id == inv.event_id, Event.tenant_id == auth.tenant_id))).scalar_one_or_none()
+        if inv
+        else None
+    )
+    client = (
+        (await db.execute(select(User).where(User.id == ev.primary_client_id, User.tenant_id == auth.tenant_id))).scalar_one_or_none()
+        if ev
+        else None
+    )
+
+    ms.status = "RETURNED_FOR_AMENDMENT"
+    ms.reviewer_remarks = body.remarks.strip()
+
+    db.add(
+        AuditLog(
+            tenant_id=auth.tenant_id,
+            event_id=ev.id if ev else None,
+            actor_id=auth.user.id,
+            action="MILESTONE_RETURNED_FOR_AMENDMENT",
+            new_value={"milestone_id": str(ms.id), "title": ms.title, "remarks": ms.reviewer_remarks},
+        )
+    )
+    if client:
+        await CommsService.notify_and_whatsapp(
+            db,
+            auth.tenant_id,
+            title=f"إيصال دفعة يحتاج تعديل · {ev.event_code if ev else ''}",
+            content=f"يرجى إعادة رفع إيصال ({ms.title}): {ms.reviewer_remarks}",
+            category="AMENDMENT_REQUEST",
+            event_id=ev.id if ev else None,
+            recipient_user_id=client.id,
+            recipient_phone=client.phone,
+            send_whatsapp=True,
+        )
+    await db.commit()
+    return {
+        "status": ms.status,
+        "milestone_id": str(ms.id),
+        "reviewer_remarks": ms.reviewer_remarks,
+    }
+
+
+@router.patch("/erp/finance/invoices/{invoice_id}/discount")
+async def adjust_invoice_discount_percent(
+    invoice_id: uuid.UUID,
+    body: AdjustInvoiceDiscountBody,
+    auth: AuthContext = Depends(
+        require_roles(
+            {UserType.INTERNAL_STAFF},
+            FINANCE_WRITE_ROLES | {StaffRole.SALES_MANAGER, StaffRole.OPS_MANAGER},
+        )
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+
+    pct = Decimal(str(body.discount_percent)).quantize(Decimal("0.01"))
+    if auth.staff_role not in FINANCE_WRITE_ROLES and auth.user.user_type != UserType.SUPER_ADMIN:
+        sp = (await db.execute(select(StaffProfile).where(StaffProfile.user_id == auth.user.id))).scalar_one_or_none()
+        cap = Decimal(str(sp.max_discount_percent)) if sp else Decimal("0.00")
+        if pct > cap:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Requested discount {pct}% exceeds your staff role max cap ({cap}%)",
+            )
+
+    inv = (
+        await db.execute(
+            select(Invoice)
+            .where(Invoice.id == invoice_id, Invoice.tenant_id == auth.tenant_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if inv.status == InvoiceStatus.VOIDED:
+        raise HTTPException(status_code=400, detail="Cannot discount a VOIDED invoice")
+
+    ev = (await db.execute(select(Event).where(Event.id == inv.event_id, Event.tenant_id == auth.tenant_id))).scalar_one_or_none()
+    tenant = (await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))).scalar_one()
+
+    old_discount = Decimal(str(inv.discount_amount)).quantize(Decimal("0.01"))
+    old_tax = Decimal(str(inv.tax_amount)).quantize(Decimal("0.01"))
+    old_total = Decimal(str(inv.total_amount)).quantize(Decimal("0.01"))
+    subtotal = Decimal(str(inv.subtotal)).quantize(Decimal("0.01"))
+
+    # Note: In event booking, subtotal stores gross or net depending on creation. Preserve original gross base = subtotal + old_discount if discount was already subtracted from subtotal, or if subtotal - old_discount matches taxable base.
+    # Check relationship between old_total, subtotal, old_discount, old_tax cleanly:
+    if abs((subtotal - old_discount + old_tax) - old_total) <= Decimal("0.05"):
+        gross_base = subtotal
+    else:
+        gross_base = (subtotal + old_discount).quantize(Decimal("0.01"))
+
+    old_taxable = max(Decimal("0.00"), gross_base - old_discount)
+    if old_tax > Decimal("0.00") and old_taxable > Decimal("0.00"):
+        eff_tax_rate = old_tax / old_taxable
+    elif old_tax > Decimal("0.00"):
+        eff_tax_rate = Decimal(str(tenant.tax_rate)) / Decimal("100.00")
+    else:
+        eff_tax_rate = Decimal("0.00")
+
+    new_discount = (gross_base * (pct / Decimal("100.00"))).quantize(Decimal("0.01"))
+    new_taxable = max(Decimal("0.00"), gross_base - new_discount).quantize(Decimal("0.01"))
+    new_tax = (new_taxable * eff_tax_rate).quantize(Decimal("0.01"))
+    new_total = (new_taxable + new_tax).quantize(Decimal("0.01"))
+
+    milestones = (
+        await db.execute(
+            select(PaymentMilestone)
+            .where(
+                PaymentMilestone.invoice_id == inv.id,
+                PaymentMilestone.tenant_id == auth.tenant_id,
+                PaymentMilestone.is_security_deposit == False,  # noqa: E712
+            )
+            .order_by(PaymentMilestone.due_date.asc())
+        )
+    ).scalars().all()
+    already_paid = sum((Decimal(str(m.paid_amount)) for m in milestones), Decimal("0.00"))
+    if new_total < already_paid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Discounted total ({new_total}) cannot be less than already collected payments ({already_paid})",
+        )
+
+    total_delta = (new_total - old_total).quantize(Decimal("0.01"))
+    tax_delta = (new_tax - old_tax).quantize(Decimal("0.01"))
+    net_delta = (total_delta - tax_delta).quantize(Decimal("0.01"))
+
+    inv.subtotal = gross_base
+    inv.discount_percent = pct
+    inv.discount_amount = new_discount
+    inv.tax_amount = new_tax
+    inv.total_amount = new_total
+    if new_total == already_paid and new_total > Decimal("0.00"):
+        inv.status = InvoiceStatus.PAID
+
+    unpaid_ms = [m for m in milestones if m.status != "PAID"]
+    if unpaid_ms:
+        target_remaining = (new_total - already_paid).quantize(Decimal("0.01"))
+        if len(unpaid_ms) == 1:
+            unpaid_ms[0].amount_due = target_remaining
+        else:
+            share = (target_remaining / Decimal(len(unpaid_ms))).quantize(Decimal("0.01"))
+            running = Decimal("0.00")
+            for idx, m in enumerate(unpaid_ms):
+                if idx == len(unpaid_ms) - 1:
+                    m.amount_due = (target_remaining - running).quantize(Decimal("0.01"))
+                else:
+                    m.amount_due = share
+                    running += share
+
+    je_number: Optional[str] = None
+    if total_delta != Decimal("0.00"):
+        cfg = (
+            await db.execute(select(AccountingConfig).where(AccountingConfig.tenant_id == auth.tenant_id))
+        ).scalar_one_or_none()
+        if cfg and cfg.accounts_receivable_id and cfg.hall_revenue_account_id:
+            lines: list[dict] = []
+            if total_delta < Decimal("0.00"):
+                ar_red = abs(total_delta)
+                rev_red = abs(net_delta)
+                tax_red = abs(tax_delta)
+                if rev_red > Decimal("0.00"):
+                    lines.append({"account_id": cfg.hall_revenue_account_id, "debit": rev_red, "credit": Decimal("0.00"), "memo": f"Invoice discount {pct}%"})
+                if tax_red > Decimal("0.00") and cfg.tax_payable_account_id:
+                    lines.append({"account_id": cfg.tax_payable_account_id, "debit": tax_red, "credit": Decimal("0.00"), "memo": "Tax adjustment on discount"})
+                elif tax_red > Decimal("0.00"):
+                    lines.append({"account_id": cfg.hall_revenue_account_id, "debit": tax_red, "credit": Decimal("0.00"), "memo": "Tax adjustment on discount"})
+                lines.append({"account_id": cfg.accounts_receivable_id, "debit": Decimal("0.00"), "credit": ar_red, "memo": f"AR discount {pct}%"})
+            else:
+                ar_inc = total_delta
+                rev_inc = net_delta
+                tax_inc = tax_delta
+                lines.append({"account_id": cfg.accounts_receivable_id, "debit": ar_inc, "credit": Decimal("0.00"), "memo": f"AR discount revision {pct}%"})
+                if rev_inc > Decimal("0.00"):
+                    lines.append({"account_id": cfg.hall_revenue_account_id, "debit": Decimal("0.00"), "credit": rev_inc, "memo": "Revenue adjustment"})
+                if tax_inc > Decimal("0.00") and cfg.tax_payable_account_id:
+                    lines.append({"account_id": cfg.tax_payable_account_id, "debit": Decimal("0.00"), "credit": tax_inc, "memo": "Tax adjustment"})
+                elif tax_inc > Decimal("0.00"):
+                    lines.append({"account_id": cfg.hall_revenue_account_id, "debit": Decimal("0.00"), "credit": tax_inc, "memo": "Tax adjustment"})
+
+            je = await DoubleEntryService.post_balanced_entry(
+                db=db,
+                tenant_id=auth.tenant_id,
+                created_by_id=auth.user.id,
+                reference=f"DISC-{inv.invoice_number}",
+                description=f"Invoice {inv.invoice_number} discount adjusted to {pct}% ({body.remarks or 'ERP discount'})",
+                event_id=inv.event_id,
+                is_system_posting=True,
+                lines=lines,
+            )
+            je_number = je.entry_number
+
+    db.add(
+        AuditLog(
+            tenant_id=auth.tenant_id,
+            event_id=inv.event_id,
+            actor_id=auth.user.id,
+            action="INVOICE_DISCOUNT_ADJUSTED",
+            old_value={"total_amount": float(old_total), "discount_amount": float(old_discount)},
+            new_value={
+                "discount_percent": float(pct),
+                "discount_amount": float(new_discount),
+                "total_amount": float(new_total),
+                "journal_entry_number": je_number,
+                "remarks": body.remarks,
+            },
+        )
+    )
+    await db.commit()
+    return {
+        "status": "UPDATED",
+        "invoice_id": str(inv.id),
+        "discount_percent": float(inv.discount_percent),
+        "discount_amount": float(inv.discount_amount),
+        "tax_amount": float(inv.tax_amount),
+        "total_amount": float(inv.total_amount),
+        "journal_entry_number": je_number,
+    }
 
 
 @router.get("/finance/events/{event_id}/pnl")
@@ -572,7 +856,7 @@ async def get_event_pnl(
 async def refund_security_deposit(
     event_id: uuid.UUID,
     body: RefundDepositBody = RefundDepositBody(),
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE})),
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.ADMIN, StaffRole.FINANCE})),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
@@ -607,6 +891,7 @@ async def refund_security_deposit(
     refund_amt = max(Decimal("0.00"), Decimal(str(inv.security_deposit_amount)) - deduction).quantize(Decimal("0.01"))
 
     je_number: Optional[str] = None
+    je_id: Optional[uuid.UUID] = None
     if refund_amt > Decimal("0.00"):
         cfg = (
             await db.execute(select(AccountingConfig).where(AccountingConfig.tenant_id == auth.tenant_id))
@@ -642,23 +927,58 @@ async def refund_security_deposit(
             ],
         )
         je_number = je.entry_number
+        je_id = je.id
 
+    voucher_no = await DoubleEntryService.next_sequence_number(db, auth.tenant_id, "DEP")
     inv.deposit_status = DepositStatus.REFUNDED
+    inv.refund_voucher_number = voucher_no
+    inv.refund_payment_method = body.payment_method
+    inv.refund_reference = body.reference
+    inv.refund_journal_entry_id = je_id
+
+    ev = (await db.execute(select(Event).where(Event.id == event_id, Event.tenant_id == auth.tenant_id))).scalar_one_or_none()
+    client = (
+        (await db.execute(select(User).where(User.id == ev.primary_client_id, User.tenant_id == auth.tenant_id))).scalar_one_or_none()
+        if ev
+        else None
+    )
+
     db.add(
         AuditLog(
             tenant_id=auth.tenant_id,
             event_id=event_id,
             actor_id=auth.user.id,
             action="SECURITY_DEPOSIT_REFUNDED",
-            new_value={"refund_amount": float(refund_amt), "journal_entry_number": je_number},
+            new_value={
+                "voucher_number": voucher_no,
+                "refund_amount": float(refund_amt),
+                "deduction_amount": float(deduction),
+                "journal_entry_number": je_number,
+                "remarks": body.remarks,
+            },
         )
     )
+    if client:
+        await CommsService.notify_and_whatsapp(
+            db,
+            auth.tenant_id,
+            title=f"تم رد وتسوية التأمين · {voucher_no}",
+            content=f"تم إصدار سند تسوية ورد مبلغ التأمين {voucher_no} بمبلغ {refund_amt:,.2f} عبر {body.payment_method} للفعالية {ev.event_code if ev else ''}.",
+            category="DEPOSIT_SETTLEMENT",
+            event_id=event_id,
+            recipient_user_id=client.id,
+            recipient_phone=client.phone,
+            send_whatsapp=True,
+        )
     await db.commit()
     return {
         "status": "REFUNDED",
+        "voucher_number": voucher_no,
         "deposit_status": inv.deposit_status.value,
         "refund_amount": float(refund_amt),
+        "deduction_amount": float(deduction),
         "journal_entry_number": je_number,
+        "deposit_settlement_pdf_url": f"/api/v1/exports/events/{event_id}/deposit-settlement.pdf",
     }
 
 
@@ -703,7 +1023,7 @@ async def create_event_expense(
     event_id: uuid.UUID,
     body: CreateEventExpenseBody,
     auth: AuthContext = Depends(
-        require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE, StaffRole.OPS_MANAGER})
+        require_roles({UserType.INTERNAL_STAFF}, FINANCE_WRITE_ROLES | {StaffRole.OPS_MANAGER})
     ),
     db: AsyncSession = Depends(get_db),
 ):
@@ -784,7 +1104,7 @@ async def create_event_expense(
 async def delete_event_expense(
     event_id: uuid.UUID,
     expense_id: uuid.UUID,
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, {StaffRole.OWNER, StaffRole.FINANCE})),
+    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF}, FINANCE_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:

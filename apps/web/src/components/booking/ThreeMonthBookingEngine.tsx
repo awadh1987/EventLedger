@@ -2,8 +2,12 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { ApiError, apiFetch, getAccessToken, setTenantSlug, tenantPath } from '@/lib/api';
+import { ApiError, apiFetch, getAccessToken, localizedVenueName, setTenantSlug, tenantPath } from '@/lib/api';
+import { useAuthSession } from '@/components/providers/auth-provider';
+import { BackButton } from '@/components/ui/BackButton';
+import { SelectOrOther } from '@/components/ui/SelectOrOther';
 import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
+import type { AuthUser } from '@/lib/types';
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -80,8 +84,11 @@ type TenantDetail = CatalogFields;
 
 interface HoldResponse {
   event_code: string;
+  title?: string | null;
   hold_expires_at: string;
   portal_auth_hint?: string;
+  access_token?: string | null;
+  user?: AuthUser | null;
   quote: { total_amount: number; security_deposit_amount: number; currency: string };
   invoice: { invoice_number: string };
   contract: { contract_number: string };
@@ -138,10 +145,15 @@ const PAY_OPTIONS: { code: PayMethod; ar: string; en: string }[] = [
 ];
 
 const TXT = {
-  title: { ar: 'تقويم التوفر لثلاثة أشهر والحجز الموجّه', en: '3-Month Availability & Guided Reservation' },
+  title: { ar: 'تقويم التوفر والحجز الموجّه (حتى 5 سنوات)', en: 'Availability & Guided Reservation (Up to 5 Years)' },
+  horizonBadge: { ar: 'الحجز المسبق متاح حتى 5 سنوات (60 شهراً)', en: '5-Year (60-Month) Advance Booking Open' },
+  jumpYear: { ar: 'السنة', en: 'Year' },
+  jumpMonth: { ar: 'الشهر', en: 'Month' },
   allVenues: { ar: 'كل القاعات والمقار', en: 'All Venues' },
   allHalls: { ar: 'كل القاعات', en: 'All Halls' },
   combine: { ar: 'دمج القاعات', en: 'Combine Halls' },
+  combineMulti: { ar: 'دمج قاعات إضافية (+85% لكل قاعة مدمجة)', en: 'Combine Additional Halls (+85% per extra hall)' },
+  switchHallStep1: { ar: 'تغيير أو اختيار القاعة لهذا التاريخ', en: 'Select / Switch Primary Hall for This Date' },
   prev: { ar: '‹ الأشهر الثلاثة السابقة', en: '‹ Previous 3 Months' },
   next: { ar: 'الأشهر الثلاثة التالية ›', en: 'Next 3 Months ›' },
   today: { ar: 'اليوم', en: 'Today' },
@@ -214,10 +226,16 @@ const TXT = {
 
 type TxtKey = Exclude<keyof typeof TXT, 'stepNames'>;
 
+const MAX_HORIZON_MONTHS = 60;
 const pad = (n: number) => String(n).padStart(2, '0');
 const fmtDate = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const monthStart = (d: Date) => new Date(d.getFullYear(), d.getMonth(), 1);
 const addMonths = (d: Date, n: number) => new Date(d.getFullYear(), d.getMonth() + n, 1);
+const addHorizonMonths = (d: Date, n: number) => {
+  const target = new Date(d.getFullYear(), d.getMonth() + n, 1);
+  const maxDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+  return new Date(target.getFullYear(), target.getMonth(), Math.min(d.getDate(), maxDay));
+};
 const money = (v: number, cur: string) => `${Math.round(v).toLocaleString('en-US')} ${cur}`;
 
 const STATUS_RANK: Record<DayStatus, number> = { AVAILABLE: 0, HOLD_48H: 1, UNAVAILABLE: 2 };
@@ -244,12 +262,16 @@ export default function ThreeMonthBookingEngine({
   const t = useCallback((k: TxtKey) => TXT[k][locale], [locale]);
   const locked = mode === 'TENANT_STOREFRONT';
   const router = useRouter();
+  const { user: authUser, loginSession } = useAuthSession();
 
   const [mounted, setMounted] = useState(false);
   useEffect(() => {
     setMounted(true);
   }, []);
 
+  const minAnchor = useMemo(() => monthStart(new Date()), []);
+  const maxHorizonDate = useMemo(() => addHorizonMonths(new Date(), MAX_HORIZON_MONTHS), []);
+  const maxAnchor = useMemo(() => monthStart(maxHorizonDate), [maxHorizonDate]);
   const [anchor, setAnchor] = useState<Date>(() => monthStart(new Date()));
   const [calendar, setCalendar] = useState<CalendarResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -258,24 +280,60 @@ export default function ThreeMonthBookingEngine({
   const [venueSlug, setVenueSlug] = useState<string>(locked ? (tenantSlug ?? '') : 'ALL');
   const [hallFilter, setHallFilter] = useState<string>(selectedHallId || 'ALL');
   const [merge, setMerge] = useState(false);
+  const [extraHallIds, setExtraHallIds] = useState<string[]>([]);
 
   useEffect(() => {
     if (selectedHallId) setHallFilter(selectedHallId);
   }, [selectedHallId]);
 
+  useEffect(() => {
+    if (locked && tenantSlug) setVenueSlug(tenantSlug);
+  }, [locked, tenantSlug]);
+
   const [selected, setSelected] = useState<{ date: string; slug: string; hallId: string } | null>(null);
   const [step, setStep] = useState(1);
   const wizardRef = useRef<HTMLDivElement>(null);
 
+  const clampAnchor = useCallback(
+    (d: Date) => {
+      const m = monthStart(d);
+      if (m.getTime() < minAnchor.getTime()) return minAnchor;
+      if (m.getTime() > maxAnchor.getTime()) return maxAnchor;
+      return m;
+    },
+    [minAnchor, maxAnchor]
+  );
+
   // Wizard state
   const [slot, setSlot] = useState<SlotCode>('EVENING_17_23');
   const [guests, setGuests] = useState(250);
+  const [eventType, setEventType] = useState('WEDDING');
+  const [eventTitle, setEventTitle] = useState('');
   const [cateringId, setCateringId] = useState<string>('');
+  const [cateringGuests, setCateringGuests] = useState<number | null>(null);
+  const [cateringNotes, setCateringNotes] = useState('');
+  const [customCateringTitle, setCustomCateringTitle] = useState('');
+  const [customCateringPrice, setCustomCateringPrice] = useState('0');
+  const [customCateringNotes, setCustomCateringNotes] = useState('');
   const [qty, setQty] = useState<Record<string, number>>({});
+  const [customAddons, setCustomAddons] = useState<
+    { id: string; title: string; quantity: number; unit_price: number; notes: string }[]
+  >([]);
+  const [draftAddonTitle, setDraftAddonTitle] = useState('');
+  const [draftAddonQty, setDraftAddonQty] = useState('1');
+  const [draftAddonPrice, setDraftAddonPrice] = useState('0');
+  const [draftAddonNotes, setDraftAddonNotes] = useState('');
   const [detail, setDetail] = useState<TenantDetail | null>(null);
+  const [clientAuthMode, setClientAuthMode] = useState<'REGISTER' | 'LOGIN'>('REGISTER');
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
   const [email, setEmail] = useState('');
+  const [clientPassword, setClientPassword] = useState('');
+  const [clientConfirmPassword, setClientConfirmPassword] = useState('');
+  const [loginIdentifier, setLoginIdentifier] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [inlineAuthBusy, setInlineAuthBusy] = useState(false);
+  const [inlineAuthMsg, setInlineAuthMsg] = useState<string | null>(null);
   const [category, setCategory] = useState<'INDIVIDUAL_B2C' | 'CORPORATE_B2B'>('INDIVIDUAL_B2C');
   const [company, setCompany] = useState('');
   const [taxId, setTaxId] = useState('');
@@ -292,6 +350,7 @@ export default function ThreeMonthBookingEngine({
   /* ---------------- data loading ---------------- */
 
   useEffect(() => {
+    if (locked && !tenantSlug) return;
     const ctrl = new AbortController();
     setLoading(true);
     setError(null);
@@ -322,8 +381,8 @@ export default function ThreeMonthBookingEngine({
 
   const tenants = calendar?.tenants ?? [];
   const visibleTenants = useMemo(
-    () => (venueSlug === 'ALL' ? tenants : tenants.filter((x) => x.slug === venueSlug)),
-    [tenants, venueSlug]
+    () => (locked ? tenants : venueSlug === 'ALL' ? tenants : tenants.filter((x) => x.slug === venueSlug)),
+    [locked, tenants, venueSlug]
   );
   const visibleHalls = useMemo(
     () =>
@@ -338,32 +397,133 @@ export default function ThreeMonthBookingEngine({
     return m;
   }, [tenants]);
 
+  const getPartnerHall = useCallback(
+    (hall: CalHall, tenantHalls: CalHall[]): CalHall | undefined => {
+      if (hall.combinable_with_hall_id) {
+        const direct = tenantHalls.find((h) => h.id === hall.combinable_with_hall_id);
+        if (direct) return direct;
+      }
+      return tenantHalls.find((h) => h.id !== hall.id && h.combinable_with_hall_id === hall.id);
+    },
+    []
+  );
+
   const dayIndex = useMemo(() => {
     const idx = new Map<string, CalDay>();
     const bestHall = new Map<string, string>();
     const hallDays = calendar?.days ?? {};
     const todayStr = fmtDate(new Date());
+    const maxHorizonStr = fmtDate(maxHorizonDate);
+    const hallDayLookup = new Map<string, Map<string, CalDay>>();
     visibleHalls.forEach(({ hall }) => {
+      const m = new Map<string, CalDay>();
+      (hallDays[hall.id] ?? []).forEach((d) => m.set(d.date, d));
+      hallDayLookup.set(hall.id, m);
+    });
+
+    visibleHalls.forEach(({ tenant: tn, hall }) => {
+      const combineWith: CalHall[] = [];
+      if (hallFilter === hall.id && extraHallIds.length > 0) {
+        extraHallIds.forEach((eid) => {
+          if (eid !== hall.id) {
+            const eh = tn.halls.find((x) => x.id === eid);
+            if (eh) combineWith.push(eh);
+          }
+        });
+      } else if (merge) {
+        const partnerH = getPartnerHall(hall, tn.halls);
+        if (partnerH) combineWith.push(partnerH);
+      }
+
       (hallDays[hall.id] ?? []).forEach((d) => {
-        const effective: CalDay = d.date < todayStr ? { ...d, status: 'UNAVAILABLE' } : d;
+        let effective: CalDay =
+          d.date < todayStr || d.date > maxHorizonStr ? { ...d, status: 'UNAVAILABLE', available_slots: [] } : d;
+
+        if (combineWith.length > 0 && effective.status !== 'UNAVAILABLE') {
+          let sharedSlots = [...effective.available_slots];
+          let statusRank = STATUS_RANK[effective.status];
+          let addPrice = 0;
+          for (const eh of combineWith) {
+            const ehDay = (hallDays[eh.id] ?? []).find((x) => x.date === d.date);
+            if (!ehDay || ehDay.status === 'UNAVAILABLE') {
+              sharedSlots = [];
+              statusRank = STATUS_RANK.UNAVAILABLE;
+              break;
+            }
+            sharedSlots = sharedSlots.filter((s) => ehDay.available_slots.includes(s));
+            statusRank = Math.max(statusRank, STATUS_RANK[ehDay.status]);
+            addPrice += Math.round(eh.base_price * 0.85 * 100) / 100;
+          }
+          const combinedStatus: DayStatus =
+            sharedSlots.length === 0
+              ? 'UNAVAILABLE'
+              : statusRank === STATUS_RANK.HOLD_48H
+                ? 'HOLD_48H'
+                : 'AVAILABLE';
+          effective = {
+            ...effective,
+            status: combinedStatus,
+            available_slots: sharedSlots,
+            dynamic_price: effective.dynamic_price + addPrice,
+          };
+        }
+
         const cur = idx.get(d.date);
-        if (
-          !cur ||
-          STATUS_RANK[effective.status] < STATUS_RANK[cur.status] ||
-          (effective.status === cur.status && effective.status !== 'UNAVAILABLE' && effective.dynamic_price < cur.dynamic_price)
-        ) {
+        const betterStatus = !cur || STATUS_RANK[effective.status] < STATUS_RANK[cur.status];
+        const sameStatus = cur && effective.status === cur.status && effective.status !== 'UNAVAILABLE';
+        const moreSlots = sameStatus && effective.available_slots.length > (cur?.available_slots.length ?? 0);
+        const sameSlotsCheaper =
+          sameStatus &&
+          effective.available_slots.length === (cur?.available_slots.length ?? 0) &&
+          effective.dynamic_price < (cur?.dynamic_price ?? Infinity);
+
+        if (betterStatus || moreSlots || sameSlotsCheaper) {
           idx.set(d.date, effective);
           bestHall.set(d.date, hall.id);
         }
       });
     });
     return { idx, bestHall };
-  }, [calendar, visibleHalls]);
+  }, [calendar, visibleHalls, maxHorizonDate, hallFilter, extraHallIds, merge, getPartnerHall]);
 
   const selectedCtx = selected ? hallLookup.get(selected.hallId) : undefined;
-  const selectedDay: CalDay | undefined = selected
+  const selectedVenueHalls = selectedCtx?.tenant.halls ?? [];
+  const rawSelectedDay: CalDay | undefined = selected
     ? (calendar?.days[selected.hallId] ?? []).find((d) => d.date === selected.date)
     : undefined;
+
+  const activeExtraHalls = useMemo(() => {
+    if (!selectedCtx) return [] as CalHall[];
+    return extraHallIds
+      .filter((eid) => eid !== selectedCtx.hall.id)
+      .map((eid) => selectedCtx.tenant.halls.find((h) => h.id === eid))
+      .filter((h): h is CalHall => Boolean(h));
+  }, [selectedCtx, extraHallIds]);
+
+  const partner = selectedCtx ? getPartnerHall(selectedCtx.hall, selectedCtx.tenant.halls) : undefined;
+  const canMerge = selectedVenueHalls.length > 1;
+
+  const selectedDay: CalDay | undefined = useMemo(() => {
+    if (!selected || !rawSelectedDay) return undefined;
+    if (activeExtraHalls.length === 0) return rawSelectedDay;
+    let slots = [...rawSelectedDay.available_slots];
+    let stRank = STATUS_RANK[rawSelectedDay.status];
+    for (const eh of activeExtraHalls) {
+      const ehDay = (calendar?.days[eh.id] ?? []).find((d) => d.date === selected.date);
+      if (!ehDay || ehDay.status === 'UNAVAILABLE') {
+        slots = [];
+        stRank = STATUS_RANK.UNAVAILABLE;
+        break;
+      }
+      slots = slots.filter((s) => ehDay.available_slots.includes(s));
+      stRank = Math.max(stRank, STATUS_RANK[ehDay.status]);
+    }
+    return {
+      ...rawSelectedDay,
+      available_slots: slots,
+      status: slots.length === 0 ? 'UNAVAILABLE' : stRank === STATUS_RANK.HOLD_48H ? 'HOLD_48H' : 'AVAILABLE',
+    };
+  }, [selected, rawSelectedDay, activeExtraHalls, calendar]);
 
   // Load catering + payment accounts for chosen tenant.
   useEffect(() => {
@@ -379,10 +539,6 @@ export default function ThreeMonthBookingEngine({
 
   /* ---------------- derived pricing ---------------- */
 
-  const partner = selectedCtx?.hall.combinable_with_hall_id
-    ? hallLookup.get(selectedCtx.hall.combinable_with_hall_id)?.hall
-    : undefined;
-  const canMerge = Boolean(partner);
   const currency = selectedCtx?.tenant.currency ?? 'YER';
 
   // Catalog comes from the calendar payload; the per-tenant endpoint refreshes it when available.
@@ -392,12 +548,21 @@ export default function ThreeMonthBookingEngine({
   const securityDeposit = detail?.default_security_deposit ?? selectedCtx?.tenant.default_security_deposit ?? 0;
   const paymentAccounts: PaymentAccount[] = detail?.payment_accounts ?? selectedCtx?.tenant.payment_accounts ?? [];
 
+  const effectiveCateringGuests = cateringGuests !== null ? cateringGuests : guests;
+
   const pricing = useMemo(() => {
     const hallPrice = selectedDay?.dynamic_price ?? 0;
     const cat = cateringItems.find((c) => c.id === cateringId);
-    const catering = cat ? cat.price_per_guest * guests : 0;
-    const addons = addonItems.reduce((s, a) => s + a.unit_addon_price * (qty[a.id] ?? 0), 0);
-    const mergedAddon = merge && partner ? Math.round(partner.base_price * 0.85 * 100) / 100 : 0;
+    const customCatPrice = cateringId === '__OTHER__' ? Math.max(0, Number(customCateringPrice) || 0) : 0;
+    const catering = cat
+      ? cat.price_per_guest * effectiveCateringGuests
+      : cateringId === '__OTHER__'
+        ? customCatPrice * effectiveCateringGuests
+        : 0;
+    const standardAddons = addonItems.reduce((s, a) => s + a.unit_addon_price * (qty[a.id] ?? 0), 0);
+    const freeCustomAddons = customAddons.reduce((s, a) => s + Math.max(0, a.unit_price) * Math.max(1, a.quantity), 0);
+    const addons = standardAddons + freeCustomAddons;
+    const mergedAddon = activeExtraHalls.reduce((s, eh) => s + Math.round(eh.base_price * 0.85 * 100) / 100, 0);
     const rawSubtotal = hallPrice + catering + addons + mergedAddon;
     const discount =
       appliedOffer?.discount_percent && appliedOffer.discount_percent > 0
@@ -406,17 +571,91 @@ export default function ThreeMonthBookingEngine({
     const subtotal = Math.max(0, rawSubtotal - discount);
     const tax = subtotal * (taxRate / 100);
     return { hallPrice, catering, addons, mergedAddon, discount, subtotal, tax, total: subtotal + tax };
-  }, [selectedDay, cateringItems, addonItems, cateringId, guests, qty, merge, partner, taxRate, appliedOffer]);
+  }, [
+    selectedDay,
+    cateringItems,
+    addonItems,
+    cateringId,
+    customCateringPrice,
+    effectiveCateringGuests,
+    qty,
+    customAddons,
+    activeExtraHalls,
+    taxRate,
+    appliedOffer,
+  ]);
 
   /* ---------------- actions ---------------- */
 
+  const handleHallSelectionChange = useCallback(
+    (newHallFilter: string) => {
+      setHallFilter(newHallFilter);
+      if (newHallFilter === 'ALL') {
+        setExtraHallIds([]);
+        setMerge(false);
+        return;
+      }
+      const nextCtx = hallLookup.get(newHallFilter);
+      const nextPartner = nextCtx ? getPartnerHall(nextCtx.hall, nextCtx.tenant.halls) : undefined;
+      const nextExtras = merge && nextPartner ? [nextPartner.id] : [];
+      setExtraHallIds(nextExtras);
+      if (selected && nextCtx) {
+        const dEntry = (calendar?.days[newHallFilter] ?? []).find((d) => d.date === selected.date);
+        if (dEntry && dEntry.status !== 'UNAVAILABLE') {
+          setSelected({ date: selected.date, slug: nextCtx.tenant.slug, hallId: newHallFilter });
+          const firstFree = SESSIONS.find((s) => dEntry.available_slots.includes(s.code));
+          if (firstFree && !dEntry.available_slots.includes(slot)) {
+            setSlot(firstFree.code);
+          }
+          setFormError(null);
+        }
+      }
+    },
+    [hallLookup, getPartnerHall, merge, selected, calendar, slot]
+  );
+
+  const toggleGlobalMerge = useCallback(
+    (checked: boolean) => {
+      setMerge(checked);
+      if (!checked) {
+        setExtraHallIds([]);
+        return;
+      }
+      const targetHid = selected?.hallId || (hallFilter !== 'ALL' ? hallFilter : undefined);
+      const ctx = targetHid ? hallLookup.get(targetHid) : undefined;
+      if (ctx) {
+        const p = getPartnerHall(ctx.hall, ctx.tenant.halls);
+        const fallbackSibling = p || ctx.tenant.halls.find((h) => h.id !== ctx.hall.id);
+        setExtraHallIds(fallbackSibling ? [fallbackSibling.id] : []);
+      }
+    },
+    [selected, hallFilter, hallLookup, getPartnerHall]
+  );
+
+  const toggleExtraHallId = useCallback(
+    (hid: string) => {
+      setExtraHallIds((prev) => {
+        const exists = prev.includes(hid);
+        const next = exists ? prev.filter((x) => x !== hid) : [...prev, hid];
+        setMerge(next.length > 0);
+        return next;
+      });
+    },
+    []
+  );
+
   const pickDay = (date: string) => {
     const day = dayIndex.idx.get(date);
-    const hallId = dayIndex.bestHall.get(date);
+    const hallId = hallFilter !== 'ALL' && hallLookup.has(hallFilter) ? hallFilter : dayIndex.bestHall.get(date);
     if (!day || !hallId || day.status === 'UNAVAILABLE') return;
     const ctx = hallLookup.get(hallId);
     if (!ctx) return;
     setSelected({ date, slug: ctx.tenant.slug, hallId });
+    if (merge && extraHallIds.length === 0) {
+      const p = getPartnerHall(ctx.hall, ctx.tenant.halls);
+      const fallbackSibling = p || ctx.tenant.halls.find((h) => h.id !== ctx.hall.id);
+      if (fallbackSibling) setExtraHallIds([fallbackSibling.id]);
+    }
     setStep(1);
     setResult(null);
     setFormError(null);
@@ -440,13 +679,70 @@ export default function ThreeMonthBookingEngine({
     }
   };
 
+  useEffect(() => {
+    if (authUser && (authUser.user_type === 'CLIENT_PRIMARY' || authUser.user_type === 'CLIENT_DELEGATE')) {
+      setFullName((prev) => prev || authUser.full_name || '');
+      setPhone((prev) => prev || authUser.phone || '');
+      setEmail((prev) => prev || authUser.email || '');
+    }
+  }, [authUser]);
+
   const validateStep = (s: number): boolean => {
     if (s === 1) return guests >= 10 && Boolean(selectedDay?.available_slots.includes(slot) || selectedDay?.status === 'HOLD_48H');
     if (s === 3) {
       if (fullName.trim().length < 2 || phone.trim().length < 7) return false;
       if (category === 'CORPORATE_B2B' && (!company.trim() || !taxId.trim())) return false;
+      const isSignedClient = Boolean(authUser && (authUser.user_type === 'CLIENT_PRIMARY' || authUser.user_type === 'CLIENT_DELEGATE'));
+      if (!isSignedClient && clientAuthMode === 'REGISTER') {
+        if (clientPassword.length < 8 || clientPassword !== clientConfirmPassword) return false;
+      }
+      if (!isSignedClient && clientAuthMode === 'LOGIN' && !loginPassword && !clientPassword) return false;
     }
     return true;
+  };
+
+  const handleInlineClientSignIn = async () => {
+    if (!selected || !loginIdentifier.trim() || !loginPassword) return;
+    setInlineAuthBusy(true);
+    setFormError(null);
+    setInlineAuthMsg(null);
+    try {
+      const loginRes = await apiFetch<{ status: string; access_token?: string; user?: AuthUser }>(
+        '/api/v1/auth/login',
+        {
+          method: 'POST',
+          skipAuth: true,
+          body: { identifier: loginIdentifier.trim(), password: loginPassword, tenant_slug: selected.slug },
+        },
+        selected.slug
+      );
+      if (loginRes.access_token && loginRes.user) {
+        loginSession(loginRes.access_token, loginRes.user, selected.slug);
+        setFullName(loginRes.user.full_name || '');
+        setPhone(loginRes.user.phone || '');
+        setEmail(loginRes.user.email || '');
+        setClientPassword(loginPassword);
+        try {
+          const meRes = await apiFetch<{
+            profile?: { client_category?: string; company_name?: string | null; tax_id?: string | null } | null;
+          }>('/api/v1/portal/me', {}, selected.slug);
+          if (meRes.profile?.client_category === 'CORPORATE_B2B') {
+            setCategory('CORPORATE_B2B');
+            setCompany(meRes.profile.company_name || '');
+            setTaxId(meRes.profile.tax_id || '');
+          }
+        } catch {
+          // ignore optional profile fetch error
+        }
+        setInlineAuthMsg(isAr ? 'تم تسجيل الدخول وتعبئة بياناتك بنجاح ✓' : 'Signed in and details auto-filled ✓');
+      } else if (loginRes.status === 'OTP_REQUIRED') {
+        setFormError(isAr ? 'يتطلب هذا الحساب رمز تحقق 2FA عبر صفحة الدخول.' : 'This account requires 2FA OTP via Client Portal Login.');
+      }
+    } catch (e: unknown) {
+      setFormError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setInlineAuthBusy(false);
+    }
   };
 
   const goNext = () => {
@@ -483,12 +779,30 @@ export default function ThreeMonthBookingEngine({
           skipAuth: true,
           body: {
             hall_id: selected.hallId,
-            merge_combinable_hall: merge && canMerge,
-            event_type: sess.code === 'MORNING_09_15' ? 'CONFERENCE' : 'WEDDING',
+            hall_ids: [selected.hallId, ...activeExtraHalls.map((h) => h.id)],
+            merge_combinable_hall: activeExtraHalls.length > 0 || (merge && Boolean(partner)),
+            event_title: eventTitle.trim() || null,
+            event_type: eventType.trim() || (sess.code === 'MORNING_09_15' ? 'CONFERENCE' : 'WEDDING'),
             start_time: `${selected.date}T${sess.start}:00`,
             end_time: `${selected.date}T${sess.end}:00`,
             guest_count: guests,
-            catering_item_id: cateringId || null,
+            catering_item_id: cateringId && cateringId !== '__OTHER__' ? cateringId : null,
+            catering_guest_count: effectiveCateringGuests,
+            catering_notes: cateringNotes.trim() || null,
+            custom_catering:
+              cateringId === '__OTHER__' && customCateringTitle.trim()
+                ? {
+                  title: customCateringTitle.trim(),
+                  price_per_guest: Math.max(0, Number(customCateringPrice) || 0),
+                  notes: customCateringNotes.trim() || null,
+                }
+                : null,
+            custom_addons: customAddons.map((a) => ({
+              title: a.title,
+              quantity: Math.max(1, a.quantity),
+              unit_price: Math.max(0, a.unit_price),
+              notes: a.notes || null,
+            })),
             offer_id: appliedOffer?.id || null,
             addons,
             payment_mode: payMode === 'HOLD' ? 'HOLD_48H' : 'IMMEDIATE_DEPOSIT',
@@ -497,6 +811,16 @@ export default function ThreeMonthBookingEngine({
             client_full_name: fullName.trim(),
             client_phone: phone.trim(),
             client_email: email.trim() || null,
+            client_password:
+              clientAuthMode === 'LOGIN'
+                ? (loginPassword || clientPassword || undefined)
+                : clientPassword.length >= 8
+                  ? clientPassword
+                  : undefined,
+            client_auth_mode:
+              authUser && (authUser.user_type === 'CLIENT_PRIMARY' || authUser.user_type === 'CLIENT_DELEGATE')
+                ? 'GUEST_AUTO'
+                : clientAuthMode,
             client_category: category,
             company_name: category === 'CORPORATE_B2B' ? company.trim() : null,
             tax_id: category === 'CORPORATE_B2B' ? taxId.trim() : null,
@@ -504,6 +828,9 @@ export default function ThreeMonthBookingEngine({
         },
         selected.slug
       );
+      if (res.access_token && res.user) {
+        loginSession(res.access_token, res.user, selected.slug);
+      }
       setResult(res);
       setReceiptState('NONE');
       const firstMilestone = res.milestones[0];
@@ -541,17 +868,16 @@ export default function ThreeMonthBookingEngine({
     : ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
   const pill = (active: boolean) =>
-    `rounded-full border px-3 py-1.5 text-sm transition ${
-      active
-        ? 'border-[var(--brand-primary,#D4AF37)] bg-[var(--brand-primary,#D4AF37)] text-slate-900 font-semibold'
-        : 'border-slate-300 bg-white text-slate-700 hover:border-[var(--brand-primary,#D4AF37)] dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200'
+    `rounded-full border px-3 py-1.5 text-sm transition ${active
+      ? 'border-[var(--brand-primary,#D4AF37)] bg-[var(--brand-primary,#D4AF37)] text-slate-900 font-semibold'
+      : 'border-slate-300 bg-white text-slate-700 hover:border-[var(--brand-primary,#D4AF37)] dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200'
     }`;
   const inputCls =
     'w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100';
   const labelCls = 'mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300';
 
   const venueForHalls = locked
-    ? tenants.find((x) => x.slug === tenantSlug)
+    ? tenants.find((x) => x.slug === tenantSlug) || tenants[0]
     : venueSlug === 'ALL'
       ? undefined
       : tenants.find((x) => x.slug === venueSlug);
@@ -587,9 +913,8 @@ export default function ThreeMonthBookingEngine({
                 onClick={() => pickDay(ds)}
                 aria-label={ds}
                 aria-pressed={isSel}
-                className={`flex h-12 flex-col items-center justify-center rounded-md text-xs transition ${cls} ${
-                  isSel ? 'ring-2 ring-[var(--brand-primary,#D4AF37)] ring-offset-1' : ''
-                }`}
+                className={`flex h-12 flex-col items-center justify-center rounded-md text-xs transition ${cls} ${isSel ? 'ring-2 ring-[var(--brand-primary,#D4AF37)] ring-offset-1' : ''
+                  }`}
               >
                 <span className="font-semibold">{d}</span>
                 {day && day.status !== 'UNAVAILABLE' && (
@@ -632,7 +957,7 @@ export default function ThreeMonthBookingEngine({
                   className={pill(venueSlug === 'ALL')}
                   onClick={() => {
                     setVenueSlug('ALL');
-                    setHallFilter('ALL');
+                    handleHallSelectionChange('ALL');
                   }}
                 >
                   {t('allVenues')}
@@ -644,10 +969,10 @@ export default function ThreeMonthBookingEngine({
                     className={pill(venueSlug === v.slug)}
                     onClick={() => {
                       setVenueSlug(v.slug);
-                      setHallFilter('ALL');
+                      handleHallSelectionChange('ALL');
                     }}
                   >
-                    {v.name}
+                    {localizedVenueName(v.name, locale) || v.name}
                   </button>
                 ))}
               </div>
@@ -655,23 +980,35 @@ export default function ThreeMonthBookingEngine({
             <div>
               <span className={labelCls}>{t('hall')}</span>
               <div className="flex flex-wrap gap-2">
-                <button type="button" className={pill(hallFilter === 'ALL')} onClick={() => setHallFilter('ALL')}>
+                <button type="button" className={pill(hallFilter === 'ALL')} onClick={() => handleHallSelectionChange('ALL')}>
                   {t('allHalls')}
                 </button>
                 {hallChoices.map((h) => (
-                  <button type="button" key={h.id} className={pill(hallFilter === h.id)} onClick={() => setHallFilter(h.id)}>
+                  <button type="button" key={h.id} className={pill(hallFilter === h.id)} onClick={() => handleHallSelectionChange(h.id)}>
                     {hallName(h)}
                   </button>
                 ))}
               </div>
             </div>
             <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={merge} onChange={(e) => setMerge(e.target.checked)} />
+              <input type="checkbox" checked={merge} onChange={(e) => toggleGlobalMerge(e.target.checked)} />
               {t('combine')}
             </label>
           </div>
         ) : (
           <div className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className={labelCls}>{t('hall')}</span>
+              {hallChoices.length > 1 && (
+                <button
+                  type="button"
+                  className={pill(hallFilter === 'ALL')}
+                  onClick={() => handleHallSelectionChange('ALL')}
+                >
+                  {t('allHalls')} ({hallChoices.length})
+                </button>
+              )}
+            </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {hallChoices.map((h) => {
                 const active = hallFilter === h.id;
@@ -679,12 +1016,11 @@ export default function ThreeMonthBookingEngine({
                   <button
                     type="button"
                     key={h.id}
-                    onClick={() => setHallFilter(active ? 'ALL' : h.id)}
-                    className={`rounded-xl border p-3 text-start transition ${
-                      active
-                        ? 'border-[var(--brand-primary,#D4AF37)] bg-[var(--brand-primary,#D4AF37)]/10'
-                        : 'border-slate-200 dark:border-slate-700'
-                    }`}
+                    onClick={() => handleHallSelectionChange(active ? 'ALL' : h.id)}
+                    className={`rounded-xl border p-3 text-start transition ${active
+                      ? 'border-[var(--brand-primary,#D4AF37)] bg-[var(--brand-primary,#D4AF37)]/10'
+                      : 'border-slate-200 dark:border-slate-700'
+                      }`}
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="font-semibold">{hallName(h)}</span>
@@ -706,26 +1042,88 @@ export default function ThreeMonthBookingEngine({
                 );
               })}
             </div>
-            <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={merge} onChange={(e) => setMerge(e.target.checked)} />
-              {t('combine')}
-            </label>
+            {hallChoices.length > 1 && (
+              <label className="flex items-center gap-2 text-sm">
+                <input type="checkbox" checked={merge} onChange={(e) => toggleGlobalMerge(e.target.checked)} />
+                {t('combine')}
+              </label>
+            )}
           </div>
         )}
       </SpotlightCard>
 
-      {/* 2. Calendar header + legend */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex gap-2">
-          <button type="button" className={pill(false)} onClick={() => setAnchor((a) => addMonths(a, -3))}>
+      {/* 2. Calendar header + 5-year jump + legend */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={anchor.getTime() <= minAnchor.getTime()}
+            className={`${pill(false)} disabled:cursor-not-allowed disabled:opacity-40`}
+            onClick={() => setAnchor((a) => clampAnchor(addMonths(a, -3)))}
+          >
             {t('prev')}
           </button>
-          <button type="button" className={pill(false)} onClick={() => setAnchor(monthStart(new Date()))}>
+          <button type="button" className={pill(false)} onClick={() => setAnchor(minAnchor)}>
             {t('today')}
           </button>
-          <button type="button" className={pill(false)} onClick={() => setAnchor((a) => addMonths(a, 3))}>
+          <button
+            type="button"
+            disabled={anchor.getTime() >= maxAnchor.getTime()}
+            className={`${pill(false)} disabled:cursor-not-allowed disabled:opacity-40`}
+            onClick={() => setAnchor((a) => clampAnchor(addMonths(a, 3)))}
+          >
             {t('next')}
           </button>
+          <div className="flex items-center gap-1.5">
+            <label htmlFor="tmbe-jump-year" className="text-xs font-medium text-slate-600 dark:text-slate-300">
+              {t('jumpYear')}
+            </label>
+            <select
+              id="tmbe-jump-year"
+              aria-label={t('jumpYear')}
+              value={anchor.getFullYear()}
+              onChange={(e) => {
+                const yr = Number(e.target.value);
+                setAnchor(clampAnchor(new Date(yr, anchor.getMonth(), 1)));
+              }}
+              className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            >
+              {Array.from(
+                { length: maxAnchor.getFullYear() - minAnchor.getFullYear() + 1 },
+                (_, idx) => minAnchor.getFullYear() + idx
+              ).map((yr) => (
+                <option key={yr} value={yr}>
+                  {yr}
+                </option>
+              ))}
+            </select>
+            <label htmlFor="tmbe-jump-month" className="text-xs font-medium text-slate-600 dark:text-slate-300">
+              {t('jumpMonth')}
+            </label>
+            <select
+              id="tmbe-jump-month"
+              aria-label={t('jumpMonth')}
+              value={anchor.getMonth()}
+              onChange={(e) => {
+                const mo = Number(e.target.value);
+                setAnchor(clampAnchor(new Date(anchor.getFullYear(), mo, 1)));
+              }}
+              className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            >
+              {Array.from({ length: 12 }, (_, mo) => {
+                const candidate = new Date(anchor.getFullYear(), mo, 1);
+                const outOfBounds = candidate.getTime() < minAnchor.getTime() || candidate.getTime() > maxAnchor.getTime();
+                return (
+                  <option key={mo} value={mo} disabled={outOfBounds}>
+                    {candidate.toLocaleDateString(isAr ? 'ar-YE-u-nu-latn' : 'en-US', { month: 'long' })}
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+          <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
+            {t('horizonBadge')}
+          </span>
         </div>
         <div className="flex flex-wrap gap-3 text-xs">
           <span className="flex items-center gap-1">
@@ -751,17 +1149,17 @@ export default function ThreeMonthBookingEngine({
         {mounted
           ? months.map(renderMonth)
           : [0, 1, 2].map((i) => (
-              <SpotlightCard key={i} className="h-64 animate-pulse !p-3">
-                <div className="h-full rounded-lg bg-slate-100 dark:bg-slate-800/40" />
-              </SpotlightCard>
-            ))}
+            <SpotlightCard key={i} className="h-64 animate-pulse !p-3">
+              <div className="h-full rounded-lg bg-slate-100 dark:bg-slate-800/40" />
+            </SpotlightCard>
+          ))}
       </div>
 
       {selected && selectedCtx && (
         <p className="rounded-lg bg-emerald-50 p-3 text-sm font-medium text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-100">
           {isAr
-            ? `✔ تم اختيار ${selectedCtx.tenant.name} — ${selectedCtx.hall.name_ar} بتاريخ ${selected.date}`
-            : `✔ ${selectedCtx.tenant.name} — ${selectedCtx.hall.name} selected for ${selected.date}`}
+            ? `✔ تم اختيار ${localizedVenueName(selectedCtx.tenant.name, locale)} — ${selectedCtx.hall.name_ar}${activeExtraHalls.length > 0 ? ` + ${activeExtraHalls.map((h) => h.name_ar).join(' + ')}` : ''} بتاريخ ${selected.date}`
+            : `✔ ${localizedVenueName(selectedCtx.tenant.name, locale)} — ${selectedCtx.hall.name}${activeExtraHalls.length > 0 ? ` + ${activeExtraHalls.map((h) => h.name).join(' + ')}` : ''} selected for ${selected.date}`}
         </p>
       )}
 
@@ -779,6 +1177,19 @@ export default function ThreeMonthBookingEngine({
                   {row(t('deposit'), money(result.quote.security_deposit_amount, result.quote.currency))}
                   {row(t('expires'), new Date(result.hold_expires_at + 'Z').toLocaleString(isAr ? 'ar-YE-u-nu-latn' : 'en-US'))}
                 </div>
+                {payMode === 'PAY_NOW' && (receiptState === 'UPLOADED' || transferRef.trim()) ? (
+                  <p className="rounded-lg border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-xs text-sky-800 dark:text-sky-200">
+                    {isAr
+                      ? 'تم تسجيل إثبات دفع العربون وهو قيد المراجعة من قسم المالية (UNDER_REVIEW)، ما يحمي الموعد من الإلغاء التلقائي أثناء المراجعة.'
+                      : 'Immediate deposit proof is submitted and UNDER_REVIEW with Finance, protecting this slot from 48-hour auto-expiry during verification.'}
+                  </p>
+                ) : (
+                  <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+                    {isAr
+                      ? `حجز مؤقت (HOLD_48H): يرجى رفع إيصال دفعة التأكيد قبل ${new Date(result.hold_expires_at + 'Z').toLocaleString('ar-YE-u-nu-latn')} لتجنب تحرير الموعد تلقائياً.`
+                      : `48-Hour Provisional Hold: upload your confirmation deposit receipt before ${new Date(result.hold_expires_at + 'Z').toLocaleString('en-US')} to avoid automatic release.`}
+                  </p>
+                )}
                 {result.portal_auth_hint === 'OTP_LOGIN_REQUIRED' && (
                   <p className="rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">
                     {isAr
@@ -795,12 +1206,12 @@ export default function ThreeMonthBookingEngine({
                   ))}
                 </ul>
                 {receiptState === 'UPLOADED' && (
-                  <p role="status" className="rounded-lg bg-emerald-50 p-2 text-sm text-emerald-800">
+                  <p role="status" className="rounded-lg bg-emerald-50 p-2 text-sm text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-200">
                     {t('receiptUploaded')}
                   </p>
                 )}
                 {receiptState === 'FAILED' && (
-                  <p role="alert" className="rounded-lg bg-amber-50 p-2 text-sm text-amber-800">
+                  <p role="alert" className="rounded-lg bg-amber-50 p-2 text-sm text-amber-800 dark:bg-amber-900/30 dark:text-amber-200">
                     {t('receiptFailed')}
                   </p>
                 )}
@@ -837,13 +1248,12 @@ export default function ThreeMonthBookingEngine({
                   {TXT.stepNames[locale].map((name, i) => (
                     <li
                       key={name}
-                      className={`rounded-full px-3 py-1 ${
-                        step === i + 1
-                          ? 'bg-[var(--brand-primary,#D4AF37)] font-semibold text-slate-900'
-                          : step > i + 1
-                            ? 'bg-emerald-100 text-emerald-800'
-                            : 'bg-slate-100 text-slate-500 dark:bg-slate-800'
-                      }`}
+                      className={`rounded-full px-3 py-1 ${step === i + 1
+                        ? 'bg-[var(--brand-primary,#D4AF37)] font-semibold text-slate-900'
+                        : step > i + 1
+                          ? 'bg-emerald-100 text-emerald-800'
+                          : 'bg-slate-100 text-slate-500 dark:bg-slate-800'
+                        }`}
                     >
                       {t('step')} {i + 1}: {name}
                     </li>
@@ -853,13 +1263,73 @@ export default function ThreeMonthBookingEngine({
                 {step === 1 && (
                   <div className="space-y-3">
                     <div className="grid gap-1 text-sm">
-                      {row(t('venue'), selectedCtx.tenant.name)}
+                      {row(t('venue'), localizedVenueName(selectedCtx.tenant.name, locale))}
                       {row(
                         t('hall'),
-                        hallName(selectedCtx.hall) + (merge && partner ? ` + ${hallName(partner)}` : '')
+                        hallName(selectedCtx.hall) +
+                          (activeExtraHalls.length > 0
+                            ? ` + ${activeExtraHalls.map((h) => hallName(h)).join(' + ')}`
+                            : '')
                       )}
                       {row('📅', selected.date)}
                     </div>
+                    {selectedVenueHalls.length > 1 && (
+                      <div className="space-y-2 rounded-xl border border-slate-200 bg-slate-50/70 p-3 dark:border-slate-700 dark:bg-slate-800/40">
+                        <span className={labelCls}>{t('switchHallStep1')}</span>
+                        <div className="flex flex-wrap gap-2">
+                          {selectedVenueHalls.map((vh) => {
+                            const hDay = (calendar?.days[vh.id] ?? []).find((d) => d.date === selected.date);
+                            const isPrimary = selected.hallId === vh.id;
+                            const isExtra = activeExtraHalls.some((eh) => eh.id === vh.id);
+                            const isAvail = Boolean(hDay && hDay.status !== 'UNAVAILABLE');
+                            return (
+                              <button
+                                type="button"
+                                key={vh.id}
+                                disabled={!isAvail || isExtra}
+                                onClick={() => {
+                                  if (!isAvail || isExtra) return;
+                                  setSelected({ date: selected.date, slug: selectedCtx.tenant.slug, hallId: vh.id });
+                                  setExtraHallIds((prev) => prev.filter((id) => id !== vh.id));
+                                  if (hDay) {
+                                    const free = hDay.available_slots;
+                                    const first = SESSIONS.find((s) => free.includes(s.code));
+                                    if (first && !free.includes(slot)) setSlot(first.code);
+                                  }
+                                }}
+                                className={`${pill(isPrimary)} disabled:cursor-not-allowed disabled:opacity-40`}
+                              >
+                                {hallName(vh)} ({vh.capacity_banquet})
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <span className={`${labelCls} pt-1`}>{t('combineMulti')}</span>
+                        <div className="flex flex-wrap gap-2">
+                          {selectedVenueHalls
+                            .filter((vh) => vh.id !== selected.hallId)
+                            .map((vh) => {
+                              const hDay = (calendar?.days[vh.id] ?? []).find((d) => d.date === selected.date);
+                              const isAvail = Boolean(hDay && hDay.status !== 'UNAVAILABLE');
+                              const isChecked = activeExtraHalls.some((eh) => eh.id === vh.id);
+                              const isPartner = partner?.id === vh.id;
+                              return (
+                                <button
+                                  type="button"
+                                  key={vh.id}
+                                  disabled={!isAvail}
+                                  onClick={() => toggleExtraHallId(vh.id)}
+                                  className={`${pill(isChecked)} disabled:cursor-not-allowed disabled:opacity-40`}
+                                >
+                                  {isChecked ? '✔ ' : '+ '}
+                                  {hallName(vh)}
+                                  {isPartner ? (isAr ? ' · قابلة للدمج' : ' · Combinable') : ''}
+                                </button>
+                              );
+                            })}
+                        </div>
+                      </div>
+                    )}
                     <div>
                       <span className={labelCls}>{t('session')}</span>
                       <div className="flex flex-wrap gap-2">
@@ -879,12 +1349,40 @@ export default function ThreeMonthBookingEngine({
                         })}
                       </div>
                     </div>
-                    {canMerge && (
-                      <label className="flex items-center gap-2 text-sm">
-                        <input type="checkbox" checked={merge} onChange={(e) => setMerge(e.target.checked)} />
-                        {t('combine')} ({partner ? hallName(partner) : ''})
+                    <div>
+                      <label className={labelCls}>
+                        {isAr ? 'نوع المناسبة' : 'Event Type'}
                       </label>
-                    )}
+                      <SelectOrOther
+                        value={eventType}
+                        onChange={(v) => setEventType(v || 'WEDDING')}
+                        locale={locale}
+                        options={[
+                          { value: 'WEDDING', labelAr: 'حفل زفاف', labelEn: 'Wedding' },
+                          { value: 'CONFERENCE', labelAr: 'مؤتمر / ندوة', labelEn: 'Conference / Summit' },
+                          { value: 'GALA', labelAr: 'حفل عشاء رسمي', labelEn: 'Gala Dinner' },
+                          { value: 'ENGAGEMENT', labelAr: 'حفل خطوبة', labelEn: 'Engagement' },
+                        ]}
+                        placeholderAr="اختر نوع المناسبة..."
+                        placeholderEn="Select event type..."
+                        otherPlaceholderAr="أدخل نوع مناسبة مخصص..."
+                        otherPlaceholderEn="Enter custom event type..."
+                        className={inputCls}
+                      />
+                    </div>
+                    <div>
+                      <label className={labelCls} htmlFor="tmbe-title">
+                        {isAr ? 'عنوان المناسبة (اختياري)' : 'Event Title (optional)'}
+                      </label>
+                      <input
+                        id="tmbe-title"
+                        maxLength={255}
+                        placeholder={isAr ? 'مثال: حفل زفاف آل ... أو مؤتمر ...' : 'e.g. Royal Wedding Reception or Annual Summit'}
+                        value={eventTitle}
+                        onChange={(e) => setEventTitle(e.target.value)}
+                        className={inputCls}
+                      />
+                    </div>
                     <div>
                       <label className={labelCls} htmlFor="tmbe-guests">
                         {t('guests')}
@@ -903,29 +1401,87 @@ export default function ThreeMonthBookingEngine({
 
                 {step === 2 && (
                   <div className="space-y-4">
-                    <div>
-                      <label className={labelCls} htmlFor="tmbe-cat">
-                        {t('catering')}
-                      </label>
-                      <select
-                        id="tmbe-cat"
-                        className={inputCls}
-                        value={cateringId}
-                        onChange={(e) => setCateringId(e.target.value)}
-                      >
-                        <option value="">{t('none')}</option>
-                        {cateringItems.length === 0 && (
-                          <option value="" disabled>
-                            {t('noCatering')}
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div>
+                        <label className={labelCls} htmlFor="tmbe-cat">
+                          {t('catering')}
+                        </label>
+                        <select
+                          id="tmbe-cat"
+                          className={inputCls}
+                          value={cateringId}
+                          onChange={(e) => setCateringId(e.target.value)}
+                        >
+                          <option value="">{t('none')}</option>
+                          {cateringItems.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {isAr ? c.name_ar : c.name_en} — {money(c.price_per_guest, currency)}
+                            </option>
+                          ))}
+                          <option value="__OTHER__">
+                            {isAr ? 'أخرى (ضيافة مخصصة / مجانية)' : 'Other (Custom / Free Catering Entry)'}
                           </option>
-                        )}
-                        {cateringItems.map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {isAr ? c.name_ar : c.name_en} — {money(c.price_per_guest, currency)}
-                          </option>
-                        ))}
-                      </select>
+                        </select>
+                      </div>
+                      <div>
+                        <label className={labelCls} htmlFor="tmbe-cat-guests">
+                          {isAr ? 'عدد وجبات الضيافة القابل للتعديل' : 'Editable Catering Guest Count'}
+                        </label>
+                        <input
+                          id="tmbe-cat-guests"
+                          type="number"
+                          min={0}
+                          value={effectiveCateringGuests}
+                          onChange={(e) => setCateringGuests(Math.max(0, Number(e.target.value) || 0))}
+                          className={inputCls}
+                        />
+                      </div>
                     </div>
+
+                    {cateringId === '__OTHER__' && (
+                      <div className="space-y-2 rounded-xl border border-amber-500/40 bg-amber-500/5 p-3">
+                        <div className="text-xs font-bold text-amber-700 dark:text-amber-300">
+                          {isAr ? 'تفاصيل الضيافة المخصصة (اترك السعر 0 للطلب المجاني / حسب التسعير)' : 'Custom Catering Request (0 = Free / Quoted)'}
+                        </div>
+                        <div className="grid gap-2 sm:grid-cols-3">
+                          <input
+                            value={customCateringTitle}
+                            onChange={(e) => setCustomCateringTitle(e.target.value)}
+                            placeholder={isAr ? 'وصف الضيافة (مثال: بوفيه تقليدي خاص)...' : 'Custom catering description...'}
+                            className={`${inputCls} sm:col-span-2`}
+                          />
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.01"
+                            value={customCateringPrice}
+                            onChange={(e) => setCustomCateringPrice(e.target.value)}
+                            placeholder={isAr ? 'السعر/ضيف (0 = مجاني)' : 'Price/guest (0 = Free)'}
+                            className={inputCls}
+                          />
+                        </div>
+                        <input
+                          value={customCateringNotes}
+                          onChange={(e) => setCustomCateringNotes(e.target.value)}
+                          placeholder={isAr ? 'ملاحظات الأصناف أو التقديم...' : 'Dietary or service notes...'}
+                          className={inputCls}
+                        />
+                      </div>
+                    )}
+
+                    <div>
+                      <label className={labelCls} htmlFor="tmbe-cat-notes">
+                        {isAr ? 'ملاحظات الضيافة والتجهيزات (اختياري)' : 'Catering & Service Notes (optional)'}
+                      </label>
+                      <input
+                        id="tmbe-cat-notes"
+                        value={cateringNotes}
+                        onChange={(e) => setCateringNotes(e.target.value)}
+                        placeholder={isAr ? 'مثال: وقت التقديم، متطلبات خاصة...' : 'Serving schedule, special instructions...'}
+                        className={inputCls}
+                      />
+                    </div>
+
                     <div>
                       <span className={labelCls}>{t('addons')}</span>
                       {addonItems.length === 0 ? (
@@ -933,7 +1489,7 @@ export default function ThreeMonthBookingEngine({
                       ) : (
                         <ul className="space-y-2">
                           {addonItems.map((a) => (
-                            <li key={a.id} className="flex items-center justify-between gap-2 text-sm">
+                            <li key={a.id} className="flex flex-wrap items-center justify-between gap-2 text-sm">
                               <span>
                                 {a.name} · {money(a.unit_addon_price, currency)}
                                 <span className="text-xs text-slate-500">
@@ -941,7 +1497,7 @@ export default function ThreeMonthBookingEngine({
                                   ({t('stock')}: {a.total_stock})
                                 </span>
                               </span>
-                              <span className="flex items-center gap-2">
+                              <span className="flex items-center gap-1.5">
                                 <button
                                   type="button"
                                   aria-label="-"
@@ -950,7 +1506,19 @@ export default function ThreeMonthBookingEngine({
                                 >
                                   −
                                 </button>
-                                <span className="w-6 text-center">{qty[a.id] ?? 0}</span>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={a.total_stock}
+                                  value={qty[a.id] ?? 0}
+                                  onChange={(e) =>
+                                    setQty((q) => ({
+                                      ...q,
+                                      [a.id]: Math.min(a.total_stock, Math.max(0, Number(e.target.value) || 0)),
+                                    }))
+                                  }
+                                  className="w-14 rounded-lg border border-slate-300 bg-white px-2 py-1 text-center font-mono text-xs dark:border-slate-700 dark:bg-slate-900"
+                                />
                                 <button
                                   type="button"
                                   aria-label="+"
@@ -967,6 +1535,91 @@ export default function ThreeMonthBookingEngine({
                         </ul>
                       )}
                     </div>
+
+                    {/* Free "Other" Custom Add-On Entries */}
+                    <div className="space-y-2 rounded-xl border border-dashed border-amber-500/40 bg-amber-500/5 p-3">
+                      <div className="text-xs font-bold text-amber-700 dark:text-amber-300">
+                        {isAr ? 'إضافة بند مخصص ("أخرى" - مجاني أو بتسعيرة مخصصة)' : 'Free / Custom "Other" Add-Ons'}
+                      </div>
+                      <div className="grid gap-2 sm:grid-cols-6">
+                        <input
+                          value={draftAddonTitle}
+                          onChange={(e) => setDraftAddonTitle(e.target.value)}
+                          placeholder={isAr ? 'اسم البند (مثال: ركن قهوة إضافي)...' : 'Custom item title...'}
+                          className={`${inputCls} sm:col-span-2`}
+                        />
+                        <input
+                          type="number"
+                          min={1}
+                          value={draftAddonQty}
+                          onChange={(e) => setDraftAddonQty(e.target.value)}
+                          placeholder={isAr ? 'الكمية' : 'Qty'}
+                          className={inputCls}
+                        />
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          value={draftAddonPrice}
+                          onChange={(e) => setDraftAddonPrice(e.target.value)}
+                          placeholder={isAr ? 'السعر (0=مجاني)' : 'Price (0=Free)'}
+                          className={inputCls}
+                        />
+                        <input
+                          value={draftAddonNotes}
+                          onChange={(e) => setDraftAddonNotes(e.target.value)}
+                          placeholder={isAr ? 'ملاحظات...' : 'Notes...'}
+                          className={inputCls}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!draftAddonTitle.trim()) return;
+                            setCustomAddons((prev) => [
+                              ...prev,
+                              {
+                                id: `${Date.now()}-${prev.length}`,
+                                title: draftAddonTitle.trim(),
+                                quantity: Math.max(1, Number(draftAddonQty) || 1),
+                                unit_price: Math.max(0, Number(draftAddonPrice) || 0),
+                                notes: draftAddonNotes.trim(),
+                              },
+                            ]);
+                            setDraftAddonTitle('');
+                            setDraftAddonQty('1');
+                            setDraftAddonPrice('0');
+                            setDraftAddonNotes('');
+                          }}
+                          className="rounded-lg bg-[var(--brand-primary,#D4AF37)] px-3 py-2 text-xs font-bold text-slate-950"
+                        >
+                          {isAr ? '+ إضافة بند' : '+ Add Custom'}
+                        </button>
+                      </div>
+                      {customAddons.length > 0 && (
+                        <ul className="space-y-1.5 pt-1">
+                          {customAddons.map((ca) => (
+                            <li
+                              key={ca.id}
+                              className="flex items-center justify-between rounded-lg bg-white/80 px-3 py-1.5 text-xs dark:bg-slate-900/70"
+                            >
+                              <span>
+                                <strong>{ca.title}</strong> × {ca.quantity} ·{' '}
+                                {ca.unit_price === 0 ? (isAr ? 'مجاني / حسب الاتفاق' : 'Free / Quoted') : money(ca.unit_price, currency)}
+                                {ca.notes ? ` — ${ca.notes}` : ''}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setCustomAddons((prev) => prev.filter((x) => x.id !== ca.id))}
+                                className="text-rose-500 underline"
+                              >
+                                {isAr ? 'حذف' : 'Remove'}
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+
                     <div className="space-y-1 rounded-lg bg-slate-50 p-3 dark:bg-slate-800/60">
                       {row(t('hallPrice'), money(pricing.hallPrice, currency))}
                       {row(t('multiplier'), `×${selectedDay.multiplier.toFixed(2)}`)}
@@ -988,6 +1641,85 @@ export default function ThreeMonthBookingEngine({
 
                 {step === 3 && (
                   <div className="space-y-3">
+                    {authUser && (authUser.user_type === 'CLIENT_PRIMARY' || authUser.user_type === 'CLIENT_DELEGATE') ? (
+                      <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3 text-xs text-emerald-700 dark:text-emerald-300">
+                        {isAr
+                          ? `مسجل الدخول كـ ${authUser.full_name} (${authUser.phone})`
+                          : `Signed in as ${authUser.full_name} (${authUser.phone})`}
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            className={pill(clientAuthMode === 'REGISTER')}
+                            onClick={() => {
+                              setClientAuthMode('REGISTER');
+                              setFormError(null);
+                            }}
+                          >
+                            {isAr ? 'حساب عميل جديد' : 'New Client Account'}
+                          </button>
+                          <button
+                            type="button"
+                            className={pill(clientAuthMode === 'LOGIN')}
+                            onClick={() => {
+                              setClientAuthMode('LOGIN');
+                              setFormError(null);
+                            }}
+                          >
+                            {isAr ? 'عميل مسجل — تسجيل الدخول' : 'Returning Client Sign In'}
+                          </button>
+                        </div>
+
+                        {clientAuthMode === 'LOGIN' && (
+                          <div className="space-y-2 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
+                            <div className="grid gap-2 sm:grid-cols-2">
+                              <div>
+                                <label className={labelCls} htmlFor="tmbe-login-id">
+                                  {isAr ? 'الجوال أو البريد الإلكتروني' : 'Phone or Email'}
+                                </label>
+                                <input
+                                  id="tmbe-login-id"
+                                  dir="ltr"
+                                  className={inputCls}
+                                  value={loginIdentifier}
+                                  onChange={(e) => setLoginIdentifier(e.target.value)}
+                                />
+                              </div>
+                              <div>
+                                <label className={labelCls} htmlFor="tmbe-login-pw">
+                                  {isAr ? 'كلمة المرور' : 'Password'}
+                                </label>
+                                <input
+                                  id="tmbe-login-pw"
+                                  type="password"
+                                  className={inputCls}
+                                  value={loginPassword}
+                                  onChange={(e) => setLoginPassword(e.target.value)}
+                                />
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={inlineAuthBusy || !loginIdentifier.trim() || !loginPassword}
+                              onClick={handleInlineClientSignIn}
+                              className="rounded-lg bg-[var(--brand-primary,#D4AF37)] px-4 py-2 text-xs font-bold text-slate-950 disabled:opacity-50"
+                            >
+                              {inlineAuthBusy
+                                ? isAr
+                                  ? 'جارٍ التحقق...'
+                                  : 'Signing in...'
+                                : isAr
+                                  ? 'دخول وتعبئة البيانات'
+                                  : 'Sign In & Auto-Fill'}
+                            </button>
+                            {inlineAuthMsg && <p className="text-xs font-semibold text-emerald-600">{inlineAuthMsg}</p>}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
                     <div>
                       <label className={labelCls} htmlFor="tmbe-name">
                         {t('fullName')}
@@ -1022,6 +1754,38 @@ export default function ThreeMonthBookingEngine({
                         />
                       </div>
                     </div>
+
+                    {!(authUser && (authUser.user_type === 'CLIENT_PRIMARY' || authUser.user_type === 'CLIENT_DELEGATE')) &&
+                      clientAuthMode === 'REGISTER' && (
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <div>
+                            <label className={labelCls} htmlFor="tmbe-cpw">
+                              {isAr ? 'كلمة مرور البوابة (8+ أحرف)' : 'Portal Password (min 8 chars)'}
+                            </label>
+                            <input
+                              id="tmbe-cpw"
+                              type="password"
+                              minLength={8}
+                              className={inputCls}
+                              value={clientPassword}
+                              onChange={(e) => setClientPassword(e.target.value)}
+                            />
+                          </div>
+                          <div>
+                            <label className={labelCls} htmlFor="tmbe-cpw2">
+                              {isAr ? 'تأكيد كلمة المرور' : 'Confirm Password'}
+                            </label>
+                            <input
+                              id="tmbe-cpw2"
+                              type="password"
+                              minLength={8}
+                              className={inputCls}
+                              value={clientConfirmPassword}
+                              onChange={(e) => setClientConfirmPassword(e.target.value)}
+                            />
+                          </div>
+                        </div>
+                      )}
                     <div>
                       <span className={labelCls}>{t('clientType')}</span>
                       <div className="flex gap-2">
@@ -1059,11 +1823,10 @@ export default function ThreeMonthBookingEngine({
                       <button
                         type="button"
                         onClick={() => setPayMode('HOLD')}
-                        className={`rounded-xl border p-3 text-start text-sm ${
-                          payMode === 'HOLD'
-                            ? 'border-[var(--brand-primary,#D4AF37)] bg-[var(--brand-primary,#D4AF37)]/10'
-                            : 'border-slate-200 dark:border-slate-700'
-                        }`}
+                        className={`rounded-xl border p-3 text-start text-sm ${payMode === 'HOLD'
+                          ? 'border-[var(--brand-primary,#D4AF37)] bg-[var(--brand-primary,#D4AF37)]/10'
+                          : 'border-slate-200 dark:border-slate-700'
+                          }`}
                       >
                         <span className="block font-semibold">{t('holdOpt')}</span>
                         <span className="text-xs text-slate-500">{t('holdDesc')}</span>
@@ -1071,11 +1834,10 @@ export default function ThreeMonthBookingEngine({
                       <button
                         type="button"
                         onClick={() => setPayMode('PAY_NOW')}
-                        className={`rounded-xl border p-3 text-start text-sm ${
-                          payMode === 'PAY_NOW'
-                            ? 'border-[var(--brand-primary,#D4AF37)] bg-[var(--brand-primary,#D4AF37)]/10'
-                            : 'border-slate-200 dark:border-slate-700'
-                        }`}
+                        className={`rounded-xl border p-3 text-start text-sm ${payMode === 'PAY_NOW'
+                          ? 'border-[var(--brand-primary,#D4AF37)] bg-[var(--brand-primary,#D4AF37)]/10'
+                          : 'border-slate-200 dark:border-slate-700'
+                          }`}
                       >
                         <span className="block font-semibold">{t('payNowOpt')}</span>
                         <span className="text-xs text-slate-500">{t('payNowDesc')}</span>
@@ -1142,14 +1904,16 @@ export default function ThreeMonthBookingEngine({
                 {formError && <p role="alert" className="text-sm text-rose-600">{formError}</p>}
 
                 <div className="flex justify-between gap-2">
-                  <button
-                    type="button"
-                    className={pill(false)}
-                    disabled={step === 1}
-                    onClick={() => setStep((s) => Math.max(1, s - 1))}
-                  >
-                    {t('back')}
-                  </button>
+                  {step > 1 ? (
+                    <BackButton
+                      locale={locale}
+                      labelAr={t('back')}
+                      labelEn={t('back')}
+                      onClick={() => setStep((s) => Math.max(1, s - 1))}
+                    />
+                  ) : (
+                    <span />
+                  )}
                   {step < 4 ? (
                     <button type="button" className={pill(true)} onClick={goNext}>
                       {t('continue')}

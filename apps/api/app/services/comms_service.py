@@ -1,12 +1,18 @@
+import os
 import re
+import urllib.parse
 import uuid
 from typing import Optional
 
+import httpx
 from fastapi import HTTPException
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.events import Event, EventMessage, EventStatus
+from app.models.events_extensions import NotificationLog
+from app.models.tenant import Tenant
 from app.models.users import User
 
 MENTION_PATTERN = re.compile(r"@(Kitchen|Finance|Ops|Security|Sales)\b", re.IGNORECASE)
@@ -16,6 +22,109 @@ class CommsService:
     @staticmethod
     def extract_mentions(content: str) -> list[str]:
         return list({m.capitalize() for m in MENTION_PATTERN.findall(content or "")})
+
+    @staticmethod
+    def build_whatsapp_deep_link(phone: Optional[str], message: str) -> Optional[str]:
+        if not phone:
+            return None
+        digits = re.sub(r"[^0-9]", "", phone)
+        if not digits:
+            return None
+        return f"https://wa.me/{digits}?text={urllib.parse.quote(message)}"
+
+    @staticmethod
+    async def send_whatsapp_with_fallback(
+        phone: str,
+        message: str,
+    ) -> tuple[str, str]:
+        """Send via Meta WhatsApp Cloud API if configured, otherwise log clean SIMULATED_FALLBACK."""
+        token = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+        phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+        digits = re.sub(r"[^0-9]", "", phone or "")
+        if not token or not phone_number_id or not digits:
+            return ("SIMULATED_FALLBACK", f"sim-wa-{uuid.uuid4().hex[:12]}")
+
+        url = f"{settings.WHATSAPP_API_URL.rstrip('/')}/{phone_number_id}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": digits,
+            "type": "text",
+            "text": {"body": message},
+        }
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+            if 200 <= resp.status_code < 300:
+                data = resp.json()
+                msg_id = ((data.get("messages") or [{}])[0]).get("id") or f"wa-{uuid.uuid4().hex[:10]}"
+                return ("SENT_PROVIDER", str(msg_id))
+            return ("SIMULATED_FALLBACK", f"fallback-http-{resp.status_code}")
+        except Exception:
+            return ("SIMULATED_FALLBACK", f"fallback-err-{uuid.uuid4().hex[:8]}")
+
+    @staticmethod
+    async def notify_and_whatsapp(
+        db: AsyncSession,
+        tenant_id: uuid.UUID,
+        *,
+        title: str,
+        content: str,
+        category: str = "STATUS_UPDATE",
+        event_id: Optional[uuid.UUID] = None,
+        recipient_user_id: Optional[uuid.UUID] = None,
+        recipient_phone: Optional[str] = None,
+        send_whatsapp: bool = False,
+        channel: str = "IN_APP",
+    ) -> dict:
+        """Create an in-app notification row and optionally dispatch WhatsApp with safe fallback."""
+        in_app_log = NotificationLog(
+            tenant_id=tenant_id,
+            event_id=event_id,
+            recipient_user_id=recipient_user_id,
+            recipient_address=recipient_phone,
+            channel="IN_APP" if channel == "IN_APP" else channel,
+            category=category,
+            title=title[:250],
+            content=content,
+            delivery_status="DELIVERED",
+            is_read=False,
+        )
+        db.add(in_app_log)
+
+        wa_status: Optional[str] = None
+        wa_msg_id: Optional[str] = None
+        if send_whatsapp and recipient_phone:
+            wa_status, wa_msg_id = await CommsService.send_whatsapp_with_fallback(recipient_phone, content)
+            wa_log = NotificationLog(
+                tenant_id=tenant_id,
+                event_id=event_id,
+                recipient_user_id=recipient_user_id,
+                recipient_address=recipient_phone,
+                channel="WHATSAPP",
+                category=category,
+                title=title[:250],
+                content=content,
+                delivery_status=wa_status,
+                provider_message_id=wa_msg_id,
+                is_read=True,
+            )
+            db.add(wa_log)
+            if wa_status == "SENT_PROVIDER":
+                tenant = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one_or_none()
+                if tenant:
+                    tenant.whatsapp_used_this_month = (tenant.whatsapp_used_this_month or 0) + 1
+
+        await db.flush()
+        return {
+            "notification_id": str(in_app_log.id),
+            "delivery_status": wa_status or "DELIVERED",
+            "provider_message_id": wa_msg_id,
+            "whatsapp_url": CommsService.build_whatsapp_deep_link(recipient_phone, content),
+        }
 
     @staticmethod
     async def post_message(
@@ -67,8 +176,12 @@ class CommsService:
         text_body = (wa_msg.get("text") or {}).get("body") or "[WhatsApp Media]"
 
         user = (
-            await db.execute(select(User).where(User.phone.in_(variants), User.is_active == True))  # noqa: E712
-        ).scalar_one_or_none()
+            await db.execute(
+                select(User)
+                .where(User.phone.in_(variants), User.is_active == True)  # noqa: E712
+                .order_by(User.last_login_at.desc().nullslast(), User.created_at.desc())
+            )
+        ).scalars().first()
         if not user or not user.tenant_id:
             return {"status": "unknown_sender"}
 

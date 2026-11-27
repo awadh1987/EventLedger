@@ -11,6 +11,7 @@ import {
   CheckCircle2,
   Clock,
   Copy,
+  Edit3,
   FileDown,
   FileSignature,
   KeyRound,
@@ -29,7 +30,10 @@ import {
 } from 'lucide-react';
 import { AppHeader } from '@/components/layout/AppHeader';
 import { MobileBottomNav } from '@/components/layout/MobileBottomNav';
+import { useNavigationHistory } from '@/components/navigation/NavigationHistoryProvider';
+import { ClientSecurityPanel } from '@/components/portal/ClientSecurityPanel';
 import { LookupSelect } from '@/components/ui/LookupSelect';
+import { SelectOrOther } from '@/components/ui/SelectOrOther';
 import { ResponsiveDataList } from '@/components/ui/ResponsiveDataList';
 import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
 import { apiFetch, downloadAuthorizedFile, getAccessToken, isNativeBuild, tenantPath } from '@/lib/api';
@@ -55,8 +59,11 @@ interface ContractDto {
   id: string;
   event_id: string;
   contract_number: string;
+  status?: string;
   terms_ar: string;
   terms_en: string;
+  remarks?: string | null;
+  amendment_remarks?: string | null;
   client_signed_at: string | null;
   client_signature_name: string | null;
   staff_countersigned_at: string | null;
@@ -112,6 +119,20 @@ interface MessageRow {
   created_at: string;
 }
 
+interface GovernanceRequestRow {
+  id: string;
+  scope: string;
+  target_entity_type: string;
+  target_entity_id: string;
+  request_title: string;
+  current_values: Record<string, unknown>;
+  proposed_values: Record<string, unknown>;
+  status: string;
+  requester_remarks: string | null;
+  reviewer_remarks: string | null;
+  created_at: string;
+}
+
 function describeApprovalPayload(ap: ApprovalRow): string {
   const p = ap.payload || {};
   if (typeof p.summary === 'string' && p.summary.trim()) return p.summary;
@@ -145,6 +166,21 @@ export default function ClientPortalDashboard() {
   } | null>(null);
 
   const [activeTab, setActiveTab] = useState<PortalTab>('EVENTS_APPROVALS');
+  const { currentSearch } = useNavigationHistory();
+
+  useEffect(() => {
+    if (!currentSearch) return;
+    const t = new URLSearchParams(currentSearch).get('tab');
+    if (
+      t === 'EVENTS_APPROVALS' ||
+      t === 'INVOICES_PAYMENTS' ||
+      t === 'PROFILE_VAULT' ||
+      t === 'DELEGATION' ||
+      t === 'PASSES_AUDIT'
+    ) {
+      setActiveTab(t);
+    }
+  }, [currentSearch]);
   const [events, setEvents] = useState<PortalEvent[]>([]);
   const [selectedEventId, setSelectedEventId] = useState<string>('');
   const [accounts, setAccounts] = useState<PaymentAccount[]>([]);
@@ -158,8 +194,9 @@ export default function ClientPortalDashboard() {
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Contract E-Sign
+  // Contract E-Sign & Return for Amendment
   const [signatureName, setSignatureName] = useState('');
+  const [contractAmendNote, setContractAmendNote] = useState('');
 
   // Guest form
   const [guestName, setGuestName] = useState('');
@@ -201,6 +238,21 @@ export default function ClientPortalDashboard() {
   const [chatDept, setChatDept] = useState('ALL');
   const [chatText, setChatText] = useState('');
 
+  // Tiered Governance Requests (Event Title & Client Identity)
+  const [govRequests, setGovRequests] = useState<GovernanceRequestRow[]>([]);
+  const [eventTitleReq, setEventTitleReq] = useState('');
+  const [eventTitleRemarks, setEventTitleRemarks] = useState('');
+  const [idChangeForm, setIdChangeForm] = useState({
+    full_name: '',
+    phone: '',
+    email: '',
+    company_name: '',
+    tax_id: '',
+    national_id_or_cr: '',
+    remarks: '',
+  });
+  const [resubmitGovId, setResubmitGovId] = useState<string | null>(null);
+
   const activeEvent = events.find((e) => e.id === selectedEventId) || events[0] || null;
 
   useEffect(() => {
@@ -234,8 +286,12 @@ export default function ClientPortalDashboard() {
   }, []);
 
   const loadAll = useCallback(async () => {
+    if (!getAccessToken()) {
+      setErrorMsg(null);
+      return;
+    }
     try {
-      const [evs, accs, apps, me] = await Promise.all([
+      const [evs, accs, apps, me, govs] = await Promise.all([
         apiFetch<PortalEvent[]>('/api/v1/portal/events'),
         apiFetch<PaymentAccount[]>('/api/v1/portal/payment-accounts'),
         apiFetch<ApprovalRow[]>('/api/v1/approvals?status=PENDING'),
@@ -254,10 +310,12 @@ export default function ClientPortalDashboard() {
             refund_bank_details?: { method?: string; account_number?: string };
           } | null;
         }>('/api/v1/portal/me'),
+        apiFetch<GovernanceRequestRow[]>('/api/v1/governance/change-requests').catch(() => [] as GovernanceRequestRow[]),
       ]);
       setEvents(evs);
       setAccounts(accs);
       setApprovals(apps);
+      setGovRequests(govs);
       if (me.user) {
         setFullName(me.user.full_name || '');
         setEmail(me.user.email || '');
@@ -293,6 +351,67 @@ export default function ClientPortalDashboard() {
       loadEventScopedData(selectedEventId);
     }
   }, [loadEventScopedData, selectedEventId]);
+
+  const submitEventTitleChange = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeEvent || !eventTitleReq.trim()) return;
+    try {
+      await apiFetch('/api/v1/governance/change-requests', {
+        method: 'POST',
+        body: {
+          target_entity_type: 'EVENT',
+          target_entity_id: activeEvent.id,
+          proposed_values: { title: eventTitleReq.trim() },
+          remarks: eventTitleRemarks.trim() || null,
+        },
+      });
+      setStatusMsg(tr('تم إرسال طلب تعديل عنوان الفعالية لاعتماد الإدارة', 'Event title change submitted for Tenant Admin approval'));
+      setEventTitleReq('');
+      setEventTitleRemarks('');
+      await loadAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to submit event title change');
+    }
+  };
+
+  const submitClientIdentityChange = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const proposed: Record<string, unknown> = {};
+    if (idChangeForm.full_name.trim()) proposed.full_name = idChangeForm.full_name.trim();
+    if (idChangeForm.phone.trim()) proposed.phone = idChangeForm.phone.trim();
+    if (idChangeForm.email.trim()) proposed.email = idChangeForm.email.trim();
+    if (idChangeForm.company_name.trim()) proposed.company_name = idChangeForm.company_name.trim();
+    if (idChangeForm.tax_id.trim()) proposed.tax_id = idChangeForm.tax_id.trim();
+    if (idChangeForm.national_id_or_cr.trim()) proposed.national_id_or_cr = idChangeForm.national_id_or_cr.trim();
+    if (Object.keys(proposed).length === 0) {
+      setErrorMsg(tr('أدخل حقلاً واحداً على الأقل للتعديل', 'Provide at least one field to change'));
+      return;
+    }
+    try {
+      if (resubmitGovId) {
+        await apiFetch(`/api/v1/governance/change-requests/${resubmitGovId}/resubmit`, {
+          method: 'PATCH',
+          body: { proposed_values: proposed, remarks: idChangeForm.remarks.trim() || null },
+        });
+        setStatusMsg(tr('تم تعديل وإعادة إرسال طلب تحديث الهوية', 'Amended identity request resubmitted'));
+        setResubmitGovId(null);
+      } else {
+        await apiFetch('/api/v1/governance/change-requests', {
+          method: 'POST',
+          body: {
+            target_entity_type: 'CLIENT',
+            proposed_values: proposed,
+            remarks: idChangeForm.remarks.trim() || null,
+          },
+        });
+        setStatusMsg(tr('تم رفع طلب تحديث بيانات الهوية لاعتماد إدارة المنشأة', 'Identity change request submitted for Tenant Admin approval'));
+      }
+      setIdChangeForm({ full_name: '', phone: '', email: '', company_name: '', tax_id: '', national_id_or_cr: '', remarks: '' });
+      await loadAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to submit client identity change');
+    }
+  };
 
   const kpis = useMemo(() => {
     const activeReservations = events.filter((e) => !['CANCELLED', 'COMPLETED'].includes(e.status)).length;
@@ -474,8 +593,8 @@ export default function ClientPortalDashboard() {
 
   const floorPlanHref = activeEvent
     ? isNativeBuild()
-      ? `/${locale}/portal/events/_/floor-plan/?id=${encodeURIComponent(activeEvent.id)}`
-      : `/${locale}/portal/events/${activeEvent.id}/floor-plan`
+      ? tenantPath(locale, tenantSlug, `/portal/events/_/floor-plan/?id=${encodeURIComponent(activeEvent.id)}`)
+      : tenantPath(locale, tenantSlug, `/portal/events/${activeEvent.id}/floor-plan`)
     : '#';
 
   const tabs: { id: PortalTab; labelAr: string; labelEn: string }[] = [
@@ -502,6 +621,7 @@ export default function ClientPortalDashboard() {
             </SpotlightHeading>
             {activeEvent && (
               <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+                {activeEvent.title ? `${activeEvent.title} · ` : ''}
                 {activeEvent.event_code} — {isRtl ? activeEvent.hall_name_ar : activeEvent.hall_name} ({activeEvent.status})
               </p>
             )}
@@ -582,16 +702,15 @@ export default function ClientPortalDashboard() {
               <div className="text-slate-600 dark:text-slate-300">
                 {pendingBooking?.client_phone
                   ? tr(
-                      `استخدم رقم جوالك (${pendingBooking.client_phone}) للدخول إلى بوابة العميل.`,
-                      `Use your phone (${pendingBooking.client_phone}) to sign in to the Client Portal.`
-                    )
+                    `استخدم رقم جوالك (${pendingBooking.client_phone}) للدخول إلى بوابة العميل.`,
+                    `Use your phone (${pendingBooking.client_phone}) to sign in to the Client Portal.`
+                  )
                   : tr('سجّل الدخول بحساب العميل أو برقم الجوال المسجل في الحجز.', 'Sign in with your client email or phone.')}
               </div>
             </div>
             <Link
-              href={`${tenantPath(locale, pendingBooking?.tenant_slug || tenantSlug, '/portal/login')}${
-                pendingBooking?.booking_code ? `?booking=${encodeURIComponent(pendingBooking.booking_code)}` : ''
-              }`}
+              href={`${tenantPath(locale, pendingBooking?.tenant_slug || tenantSlug, '/portal/login')}${pendingBooking?.booking_code ? `?booking=${encodeURIComponent(pendingBooking.booking_code)}` : ''
+                }`}
               className="inline-flex min-h-[40px] items-center rounded-lg bg-[var(--brand-primary,#D4AF37)] px-4 text-xs font-bold text-slate-950"
             >
               {tr('تسجيل دخول العميل', 'Client Portal Sign In')}
@@ -621,11 +740,10 @@ export default function ClientPortalDashboard() {
                 role="tab"
                 aria-selected={active}
                 onClick={() => setActiveTab(tab.id)}
-                className={`-mb-px whitespace-nowrap border-b-2 px-1 py-3 text-xs transition ${
-                  active
-                    ? 'border-[var(--brand-primary)] font-semibold text-slate-900 dark:text-white'
-                    : 'border-transparent font-medium text-slate-500 hover:text-[var(--brand-primary,#D4AF37)] dark:text-slate-400'
-                }`}
+                className={`-mb-px whitespace-nowrap border-b-2 px-1 py-3 text-xs transition ${active
+                  ? 'border-[var(--brand-primary)] font-semibold text-slate-900 dark:text-white'
+                  : 'border-transparent font-medium text-slate-500 hover:text-[var(--brand-primary,#D4AF37)] dark:text-slate-400'
+                  }`}
               >
                 {isRtl ? tab.labelAr : tab.labelEn}
               </button>
@@ -636,6 +754,49 @@ export default function ClientPortalDashboard() {
         {/* TAB 1: Events & Approvals */}
         {activeTab === 'EVENTS_APPROVALS' && (
           <div className="space-y-6 text-start">
+            {activeEvent && activeEvent.status === 'HOLD_48H' && (() => {
+              const firstMs = activeEvent.invoice?.milestones?.[0];
+              const isUnderReview = firstMs?.status === 'UNDER_REVIEW';
+              const isReturned = firstMs?.status === 'RETURNED_FOR_AMENDMENT';
+              return (
+                <SpotlightCard
+                  className={`flex flex-wrap items-center justify-between gap-3 ${
+                    isUnderReview
+                      ? 'border-sky-500/40 bg-sky-500/10'
+                      : 'border-amber-500/40 bg-amber-500/10'
+                  }`}
+                >
+                  <div className="space-y-1">
+                    <div className="text-xs font-bold">
+                      {isUnderReview
+                        ? tr('إثبات الدفع قيد المراجعة المالية (UNDER_REVIEW)', 'Deposit Proof Submitted — Under Finance Review')
+                        : isReturned
+                          ? tr('إيصال الدفعة مرتجع للتعديل — يرجى إعادة الرفع قبل انتهاء المهلة', 'Deposit Receipt Returned for Amendment — Re-upload Required')
+                          : tr('حجز مؤقت لمدة 48 ساعة (بانتظار إثبات دفع العربون)', '48-Hour Provisional Hold (Awaiting Deposit Proof)')}
+                    </div>
+                    <div className="text-xs text-slate-600 dark:text-slate-300">
+                      {activeEvent.hold_expires_at
+                        ? tr(
+                            `ينتهي الحجز المؤقت في: ${new Date(activeEvent.hold_expires_at + 'Z').toLocaleString('ar-YE-u-nu-latn')}`,
+                            `Provisional hold expires: ${new Date(activeEvent.hold_expires_at + 'Z').toLocaleString('en-US')}`
+                          )
+                        : tr('يرجى سداد الدفعة الأولى لتثبيت الفعالية نهائياً.', 'Upload confirmation deposit proof to confirm your booking.')}
+                      {isReturned && firstMs?.reviewer_remarks ? ` — ${firstMs.reviewer_remarks}` : ''}
+                    </div>
+                  </div>
+                  {!isUnderReview && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('INVOICES_PAYMENTS')}
+                      className="min-h-[38px] rounded-lg bg-[var(--brand-primary,#D4AF37)] px-3.5 text-xs font-bold text-slate-950"
+                    >
+                      {tr('رفع إيصال العربون الآن', 'Upload Deposit Proof')}
+                    </button>
+                  )}
+                </SpotlightCard>
+              );
+            })()}
+
             {activeEvent && (
               <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
                 <SpotlightCard className="flex items-center gap-3">
@@ -653,9 +814,8 @@ export default function ClientPortalDashboard() {
                 </SpotlightCard>
 
                 <SpotlightCard
-                  className={`flex items-center gap-3 ${
-                    cateringLocked ? 'border-rose-500/40 bg-rose-500/10' : 'border-emerald-500/30 bg-emerald-500/5'
-                  }`}
+                  className={`flex items-center gap-3 ${cateringLocked ? 'border-rose-500/40 bg-rose-500/10' : 'border-emerald-500/30 bg-emerald-500/5'
+                    }`}
                 >
                   <Lock className={`h-5 w-5 shrink-0 ${cateringLocked ? 'text-rose-500' : 'text-emerald-500'}`} />
                   <div>
@@ -667,9 +827,8 @@ export default function ClientPortalDashboard() {
                 </SpotlightCard>
 
                 <SpotlightCard
-                  className={`flex items-center gap-3 ${
-                    floorPlanLocked ? 'border-rose-500/40 bg-rose-500/10' : 'border-emerald-500/30 bg-emerald-500/5'
-                  }`}
+                  className={`flex items-center gap-3 ${floorPlanLocked ? 'border-rose-500/40 bg-rose-500/10' : 'border-emerald-500/30 bg-emerald-500/5'
+                    }`}
                 >
                   <Lock className={`h-5 w-5 shrink-0 ${floorPlanLocked ? 'text-rose-500' : 'text-emerald-500'}`} />
                   <div>
@@ -747,12 +906,42 @@ export default function ClientPortalDashboard() {
               <SpotlightHeading as="h2" className="text-base">
                 {tr('حجوزاتي ومناسباتي', 'Booked Events')}
               </SpotlightHeading>
+              {activeEvent && (
+                <form onSubmit={submitEventTitleChange} className="grid gap-2 rounded-xl border border-slate-200 p-3 text-xs dark:border-slate-800 sm:grid-cols-3">
+                  <input
+                    value={eventTitleReq}
+                    onChange={(e) => setEventTitleReq(e.target.value)}
+                    placeholder={tr(`طلب تعديل عنوان (${activeEvent.event_code})...`, `Propose new event title for ${activeEvent.event_code}...`)}
+                    className="min-h-[38px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                  />
+                  <input
+                    value={eventTitleRemarks}
+                    onChange={(e) => setEventTitleRemarks(e.target.value)}
+                    placeholder={tr('ملاحظة للإدارة (اختياري)', 'Remarks for admin (optional)')}
+                    className="min-h-[38px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                  />
+                  <button type="submit" className="inline-flex min-h-[38px] items-center justify-center gap-1.5 rounded-lg bg-[var(--brand-primary,#D4AF37)] px-3 font-bold text-slate-950">
+                    <Edit3 className="h-3.5 w-3.5" />
+                    <span>{tr('طلب تعديل العنوان', 'Request Title Edit')}</span>
+                  </button>
+                </form>
+              )}
               <ResponsiveDataList
                 data={events}
                 locale={locale}
                 mobileCardHeader={(r) => `${r.event_code} — ${isRtl ? r.hall_name_ar : r.hall_name}`}
                 columns={[
-                  { key: 'code', headerAr: 'الرمز', headerEn: 'Code', render: (r) => <span className="font-mono text-xs font-bold">{r.event_code}</span> },
+                  {
+                    key: 'code',
+                    headerAr: 'الرمز والعنوان',
+                    headerEn: 'Code & Title',
+                    render: (r) => (
+                      <div>
+                        <div className="font-mono text-xs font-bold">{r.event_code}</div>
+                        {r.title && <div className="text-[11px] font-semibold text-amber-500">{r.title}</div>}
+                      </div>
+                    ),
+                  },
                   { key: 'hall', headerAr: 'القاعة', headerEn: 'Hall', render: (r) => (isRtl ? r.hall_name_ar : r.hall_name) },
                   {
                     key: 'date',
@@ -775,11 +964,10 @@ export default function ClientPortalDashboard() {
                       <button
                         type="button"
                         onClick={() => setSelectedEventId(r.id)}
-                        className={`rounded-lg px-3 py-1 text-xs font-bold ${
-                          r.id === activeEvent?.id
-                            ? 'bg-[var(--brand-primary,#D4AF37)] text-slate-950'
-                            : 'border border-slate-300 dark:border-slate-700'
-                        }`}
+                        className={`rounded-lg px-3 py-1 text-xs font-bold ${r.id === activeEvent?.id
+                          ? 'bg-[var(--brand-primary,#D4AF37)] text-slate-950'
+                          : 'border border-slate-300 dark:border-slate-700'
+                          }`}
                       >
                         {r.id === activeEvent?.id ? tr('محدد ✓', 'Active ✓') : tr('عرض', 'Inspect')}
                       </button>
@@ -820,19 +1008,34 @@ export default function ClientPortalDashboard() {
                       <SpotlightHeading as="h2" className="text-lg">
                         {tr('الدفعات المالية ورفع الإيصالات', 'Split Milestones & Receipt Upload')}
                       </SpotlightHeading>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          downloadAuthorizedFile(
-                            `/api/v1/exports/invoices/${activeEvent.invoice!.id}/pdf?locale=${locale}`,
-                            `${activeEvent.invoice!.invoice_number}-${locale}.pdf`
-                          )
-                        }
-                        className="flex min-h-[38px] items-center gap-1.5 rounded-lg border border-slate-300 px-3 text-xs font-semibold dark:border-slate-700"
-                      >
-                        <FileDown className="h-4 w-4" />
-                        PDF
-                      </button>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            downloadAuthorizedFile(
+                              `/api/v1/exports/invoices/${activeEvent.invoice!.id}/pdf?locale=${locale}`,
+                              `${activeEvent.invoice!.invoice_number}-${locale}.pdf`
+                            )
+                          }
+                          className="flex min-h-[38px] items-center gap-1.5 rounded-lg border border-slate-300 px-3 text-xs font-semibold dark:border-slate-700"
+                        >
+                          <FileDown className="h-4 w-4" />
+                          {tr('PDF الفاتورة', 'Invoice PDF')}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            downloadAuthorizedFile(
+                              `/api/v1/exports/events/${activeEvent.id}/deposit-settlement.pdf?locale=${locale}`,
+                              `deposit-settlement-${activeEvent.event_code}-${locale}.pdf`
+                            )
+                          }
+                          className="flex min-h-[38px] items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-xs font-semibold text-amber-700 dark:text-amber-300"
+                        >
+                          <FileDown className="h-4 w-4" />
+                          {tr('سند تسوية التأمين', 'Deposit Receipt PDF')}
+                        </button>
+                      </div>
                     </div>
 
                     <div className="space-y-3">
@@ -846,6 +1049,11 @@ export default function ClientPortalDashboard() {
                             <div className="font-mono text-xs text-slate-500">
                               {Number(m.amount_due).toLocaleString()} — {m.status}
                             </div>
+                            {m.reviewer_remarks && (
+                              <div className="mt-1 rounded bg-amber-500/10 px-2 py-1 text-[11px] font-semibold text-amber-600 dark:text-amber-300">
+                                {tr('ملاحظات الإدارة (مطلوب التعديل وإعادة الرفع):', 'Reviewer Amendment Remarks:')} {m.reviewer_remarks}
+                              </div>
+                            )}
                           </div>
                           {m.status !== 'PAID' && (
                             <label className="flex min-h-[44px] cursor-pointer items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white dark:bg-slate-800">
@@ -1054,6 +1262,121 @@ export default function ClientPortalDashboard() {
                 </button>
               </form>
             </SpotlightCard>
+
+            <SpotlightCard className="space-y-4 lg:col-span-3">
+              <SpotlightHeading as="h2" className="flex items-center gap-2 text-lg">
+                <Shield className="h-5 w-5 text-[var(--brand-primary,#D4AF37)]" />
+                <span>
+                  {resubmitGovId
+                    ? tr('تعديل وإعادة إرسال طلب تحديث الهوية', 'Amend & Resubmit Identity Change Request')
+                    : tr('طلب تعديل بيانات الهوية والاتصال (يتطلب اعتماد الإدارة)', 'Governed Identity Change Request (Tenant Admin Approval)')}
+                </span>
+              </SpotlightHeading>
+              <form onSubmit={submitClientIdentityChange} className="grid gap-3 text-xs sm:grid-cols-3">
+                <input
+                  value={idChangeForm.full_name}
+                  onChange={(e) => setIdChangeForm({ ...idChangeForm, full_name: e.target.value })}
+                  placeholder={tr('الاسم الكامل الجديد (اختياري)', 'New Full Name (optional)')}
+                  className="min-h-[40px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                />
+                <input
+                  dir="ltr"
+                  value={idChangeForm.phone}
+                  onChange={(e) => setIdChangeForm({ ...idChangeForm, phone: e.target.value })}
+                  placeholder={tr('رقم الجوال الجديد', 'New Phone / WhatsApp')}
+                  className="min-h-[40px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                />
+                <input
+                  dir="ltr"
+                  type="email"
+                  value={idChangeForm.email}
+                  onChange={(e) => setIdChangeForm({ ...idChangeForm, email: e.target.value })}
+                  placeholder={tr('البريد الإلكتروني الجديد', 'New Email')}
+                  className="min-h-[40px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                />
+                <input
+                  value={idChangeForm.company_name}
+                  onChange={(e) => setIdChangeForm({ ...idChangeForm, company_name: e.target.value })}
+                  placeholder={tr('اسم الشركة', 'Company Name')}
+                  className="min-h-[40px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                />
+                <input
+                  dir="ltr"
+                  value={idChangeForm.tax_id}
+                  onChange={(e) => setIdChangeForm({ ...idChangeForm, tax_id: e.target.value })}
+                  placeholder={tr('الرقم الضريبي', 'Tax ID')}
+                  className="min-h-[40px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                />
+                <input
+                  value={idChangeForm.national_id_or_cr}
+                  onChange={(e) => setIdChangeForm({ ...idChangeForm, national_id_or_cr: e.target.value })}
+                  placeholder={tr('رقم الهوية / السجل التجاري', 'National ID / CR')}
+                  className="min-h-[40px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                />
+                <input
+                  value={idChangeForm.remarks}
+                  onChange={(e) => setIdChangeForm({ ...idChangeForm, remarks: e.target.value })}
+                  placeholder={tr('سبب التعديل / ملاحظات للمراجع', 'Reason / remarks for reviewer')}
+                  className="min-h-[40px] rounded-lg border border-slate-300 bg-white px-3 sm:col-span-2 dark:border-slate-700 dark:bg-slate-950"
+                />
+                <div className="flex gap-2">
+                  <button type="submit" className="min-h-[40px] flex-1 rounded-lg bg-[var(--brand-primary,#D4AF37)] px-4 font-bold text-slate-950">
+                    {resubmitGovId ? tr('إعادة إرسال', 'Resubmit') : tr('رفع الطلب', 'Submit Request')}
+                  </button>
+                  {resubmitGovId && (
+                    <button
+                      type="button"
+                      onClick={() => setResubmitGovId(null)}
+                      className="min-h-[40px] rounded-lg border border-slate-300 px-3 dark:border-slate-700"
+                    >
+                      {tr('إلغاء', 'Cancel')}
+                    </button>
+                  )}
+                </div>
+              </form>
+
+              {govRequests.length > 0 && (
+                <div className="space-y-2 border-t border-slate-200 pt-3 text-xs dark:border-slate-800">
+                  {govRequests.map((gr) => (
+                    <div key={gr.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 p-2.5 dark:border-slate-800">
+                      <div>
+                        <div className="font-bold">{gr.request_title}</div>
+                        <div className="font-mono text-[11px] text-slate-500">{JSON.stringify(gr.proposed_values)}</div>
+                        {gr.reviewer_remarks && (
+                          <div className="text-[11px] text-amber-500">
+                            {tr('ملاحظات الإدارة:', 'Reviewer Remarks:')} {gr.reviewer_remarks}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="rounded bg-slate-800 px-2 py-0.5 font-mono text-[10px] font-bold text-white">{gr.status}</span>
+                        {gr.status === 'RETURNED_FOR_AMENDMENT' && gr.target_entity_type === 'CLIENT' && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setResubmitGovId(gr.id);
+                              const pv = gr.proposed_values || {};
+                              setIdChangeForm({
+                                full_name: String(pv.full_name || ''),
+                                phone: String(pv.phone || ''),
+                                email: String(pv.email || ''),
+                                company_name: String(pv.company_name || ''),
+                                tax_id: String(pv.tax_id || ''),
+                                national_id_or_cr: String(pv.national_id_or_cr || ''),
+                                remarks: gr.requester_remarks || '',
+                              });
+                            }}
+                            className="rounded border border-amber-500 px-2.5 py-1 text-[11px] font-bold text-amber-500"
+                          >
+                            {tr('تعديل وإعادة إرسال', 'Amend & Resubmit')}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </SpotlightCard>
           </div>
         )}
 
@@ -1141,42 +1464,101 @@ export default function ClientPortalDashboard() {
                   <span>{tr('العقد الإلكتروني والتوقيع الرقمي', 'Digital Contract & E-Signature')}</span>
                 </SpotlightHeading>
                 {contract && (
-                  <span className="rounded-full bg-slate-100 px-3 py-1 font-mono text-xs font-bold dark:bg-slate-800">
-                    {contract.contract_number}
-                  </span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded-full bg-slate-100 px-3 py-1 font-mono text-xs font-bold dark:bg-slate-800">
+                      {contract.contract_number} · {contract.status || 'DRAFT'}
+                    </span>
+                    {activeEvent && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          downloadAuthorizedFile(
+                            `/api/v1/exports/contracts/${activeEvent.id}/pdf?locale=${locale}`,
+                            `${contract.contract_number}-${locale}.pdf`
+                          )
+                        }
+                        className="inline-flex min-h-[34px] items-center gap-1 rounded-lg border border-slate-300 px-3 text-xs font-semibold dark:border-slate-700"
+                      >
+                        <FileDown className="h-3.5 w-3.5" />
+                        <span>{tr('تحميل العقد PDF', 'Contract PDF')}</span>
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
 
               {contract ? (
-                contract.client_signed_at ? (
-                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-4 text-xs text-emerald-600 dark:text-emerald-300">
-                    <div className="flex items-center gap-2">
-                      <CheckCircle2 className="h-5 w-5" />
-                      <span>
-                        {tr('تم توقيع العقد إلكترونياً', 'Digitally Signed')}: {contract.client_signature_name}
+                <div className="space-y-3">
+                  {contract.amendment_remarks && (
+                    <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-300">
+                      <strong>{tr('ملاحظات التعديل:', 'Amendment Remarks:')}</strong> {contract.amendment_remarks}
+                    </div>
+                  )}
+                  <pre className="max-h-56 overflow-y-auto whitespace-pre-wrap rounded-xl border border-slate-200 bg-slate-50 p-3 font-sans text-xs leading-relaxed dark:border-slate-800 dark:bg-slate-950">
+                    {isRtl ? contract.terms_ar : contract.terms_en}
+                  </pre>
+                  {contract.client_signed_at ? (
+                    <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-4 text-xs text-emerald-600 dark:text-emerald-300">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="h-5 w-5" />
+                        <span>
+                          {tr('تم توقيع العقد إلكترونياً', 'Digitally Signed')}: {contract.client_signature_name}
+                        </span>
+                      </div>
+                      <span dir="ltr" className="font-mono text-[11px]">
+                        {contract.client_signed_at.slice(0, 19).replace('T', ' ')}
                       </span>
                     </div>
-                    <span dir="ltr" className="font-mono text-[11px]">
-                      {contract.client_signed_at.slice(0, 19).replace('T', ' ')}
-                    </span>
-                  </div>
-                ) : (
-                  <form onSubmit={signContract} className="grid gap-3 sm:grid-cols-3">
-                    <input
-                      required
-                      value={signatureName}
-                      onChange={(e) => setSignatureName(e.target.value)}
-                      placeholder={tr('الاسم الكامل للتوقيع', 'Full Legal Name')}
-                      className={inputCls}
-                    />
-                    <div className="flex min-h-[44px] items-center rounded-lg border border-dashed border-amber-500/40 bg-amber-500/5 px-4 font-serif italic text-amber-500">
-                      {signatureName || tr('معاينة التوقيع...', 'Signature preview...')}
+                  ) : (
+                    <div className="space-y-3">
+                      <form onSubmit={signContract} className="grid gap-3 sm:grid-cols-3">
+                        <input
+                          required
+                          value={signatureName}
+                          onChange={(e) => setSignatureName(e.target.value)}
+                          placeholder={tr('الاسم الكامل للتوقيع', 'Full Legal Name')}
+                          className={inputCls}
+                        />
+                        <div className="flex min-h-[44px] items-center rounded-lg border border-dashed border-amber-500/40 bg-amber-500/5 px-4 font-serif italic text-amber-500">
+                          {signatureName || tr('معاينة التوقيع...', 'Signature preview...')}
+                        </div>
+                        <button type="submit" className="min-h-[44px] rounded-xl bg-[var(--brand-primary,#D4AF37)] px-4 text-xs font-bold text-slate-950">
+                          {tr('توقيع العقد إلكترونياً', 'Sign Contract')}
+                        </button>
+                      </form>
+                      {activeEvent && (
+                        <div className="flex flex-wrap gap-2 border-t border-slate-200 pt-2 text-xs dark:border-slate-800">
+                          <input
+                            value={contractAmendNote}
+                            onChange={(e) => setContractAmendNote(e.target.value)}
+                            placeholder={tr('طلب تعديل على بند في العقد قبل التوقيع...', 'Request amendment on contract clauses before signing...')}
+                            className="min-h-[38px] flex-1 rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                          />
+                          <button
+                            type="button"
+                            disabled={contractAmendNote.trim().length < 2}
+                            onClick={async () => {
+                              try {
+                                await apiFetch(`/api/v1/events/${activeEvent.id}/contract`, {
+                                  method: 'PATCH',
+                                  body: { status: 'RETURNED_FOR_AMENDMENT', amendment_remarks: contractAmendNote.trim() },
+                                });
+                                setContractAmendNote('');
+                                setStatusMsg(tr('تم إرسال طلب تعديل العقد لإدارة المنشأة.', 'Contract amendment request sent to venue.'));
+                                await loadEventScopedData(activeEvent.id);
+                              } catch (err) {
+                                setErrorMsg(err instanceof Error ? err.message : 'Failed to request contract amendment');
+                              }
+                            }}
+                            className="min-h-[38px] rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 font-bold text-amber-600 disabled:opacity-40 dark:text-amber-300"
+                          >
+                            {tr('إعادة العقد للتعديل', 'Return Contract for Amendment')}
+                          </button>
+                        </div>
+                      )}
                     </div>
-                    <button type="submit" className="min-h-[44px] rounded-xl bg-[var(--brand-primary,#D4AF37)] px-4 text-xs font-bold text-slate-950">
-                      {tr('توقيع العقد إلكترونياً', 'Sign Contract')}
-                    </button>
-                  </form>
-                )
+                  )}
+                </div>
               ) : (
                 <p className="text-xs text-slate-500">{tr('لا يوجد عقد لهذه الفعالية.', 'No contract found.')}</p>
               )}
@@ -1192,12 +1574,23 @@ export default function ClientPortalDashboard() {
               <form onSubmit={addGuest} className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
                 <input required value={guestName} onChange={(e) => setGuestName(e.target.value)} placeholder={tr('اسم الضيف', 'Guest Name')} className={inputCls} />
                 <input dir="ltr" value={guestPhone} onChange={(e) => setGuestPhone(e.target.value)} placeholder="+96777..." className={inputCls} />
-                <select value={guestTier} onChange={(e) => setGuestTier(e.target.value)} className={inputCls}>
-                  <option value="STANDARD">STANDARD</option>
-                  <option value="VIP">VIP</option>
-                  <option value="FAMILY">FAMILY</option>
-                  <option value="SPEAKER">SPEAKER</option>
-                </select>
+                <SelectOrOther
+                  value={guestTier}
+                  onChange={setGuestTier}
+                  locale={locale}
+                  allowPromoteCategory="GATE_PASS_TYPE"
+                  options={[
+                    { value: 'STANDARD', labelAr: 'عادي (STANDARD)', labelEn: 'Standard (STANDARD)' },
+                    { value: 'VIP', labelAr: 'كبار الشخصيات (VIP)', labelEn: 'VIP' },
+                    { value: 'FAMILY', labelAr: 'العائلة (FAMILY)', labelEn: 'Family (FAMILY)' },
+                    { value: 'SPEAKER', labelAr: 'متحدث (SPEAKER)', labelEn: 'Speaker (SPEAKER)' },
+                  ]}
+                  placeholderAr="فئة الضيف..."
+                  placeholderEn="Guest tier..."
+                  otherPlaceholderAr="أدخل فئة ضيف مخصصة..."
+                  otherPlaceholderEn="Enter custom guest tier..."
+                  className={inputCls}
+                />
                 <input value={guestTable} onChange={(e) => setGuestTable(e.target.value)} placeholder={tr('الطاولة', 'Table')} className={inputCls} />
                 <button type="submit" className="min-h-[44px] rounded-lg bg-[var(--brand-primary,#D4AF37)] px-4 text-xs font-bold text-slate-950">
                   <QrCode className="me-1 inline h-4 w-4" />
@@ -1233,6 +1626,10 @@ export default function ClientPortalDashboard() {
                 ]}
               />
             </SpotlightCard>
+
+            {activeEvent && (
+              <ClientSecurityPanel locale={locale} event={activeEvent} onChanged={loadAll} />
+            )}
 
             {/* Event Chat + Immutable AuditLog */}
             <div className="grid gap-6 lg:grid-cols-2">

@@ -13,6 +13,7 @@ import app.models.users  # noqa: F401
 import app.models.venue  # noqa: F401
 import app.models.events  # noqa: F401
 import app.models.events_extensions  # noqa: F401
+import app.models.governance  # noqa: F401
 import app.models.accounting  # noqa: F401
 
 config = context.config

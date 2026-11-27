@@ -1,4 +1,6 @@
+import re
 import uuid
+from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import AuthContext, hash_password, require_roles
+from app.core.tenant_middleware import resolve_active_tenant_by_slug
 from app.models.accounting import Invoice
 from app.models.base import RecordLifecycle
 from app.models.events import Event, GatePass
@@ -15,11 +18,17 @@ from app.models.events_extensions import EventContract
 from app.models.tenant import SubscriptionStatus, SubscriptionTier, Tenant, TenantBranding
 from app.models.users import StaffProfile, StaffRole, User, UserType
 from app.models.venue import CateringMenuItem, Hall, InventoryItem
+from app.routers.tenant_settings import resolve_branding_tokens
+from app.services.availability_service import AvailabilityService
 
 router = APIRouter(prefix="/api/v1", tags=["Tier 1: SaaS Super-Admin & Tenant Directory"])
 
 
 class UpdateTenantAdminBody(BaseModel):
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    currency: Optional[str] = None
+    tax_rate: Optional[Decimal] = None
     is_active: Optional[bool] = None
     subscription_tier: Optional[SubscriptionTier] = None
     subscription_status: Optional[SubscriptionStatus] = None
@@ -45,7 +54,12 @@ async def list_public_tenants(db: AsyncSession = Depends(get_db)):
         branding = (
             await db.execute(select(TenantBranding).where(TenantBranding.tenant_id == t.id))
         ).scalar_one_or_none()
-        halls_count = (await db.execute(select(func.count(Hall.id)).where(Hall.tenant_id == t.id))).scalar() or 0
+        halls_count = (
+            await db.execute(
+                select(func.count(Hall.id)).where(Hall.tenant_id == t.id, Hall.lifecycle == RecordLifecycle.ACTIVE)
+            )
+        ).scalar() or 0
+        tokens = resolve_branding_tokens(t.settings)
         items.append(
             {
                 "id": str(t.id),
@@ -56,6 +70,8 @@ async def list_public_tenants(db: AsyncSession = Depends(get_db)):
                 "branding": {
                     "primaryColor": branding.primary_color if branding else "#D4AF37",
                     "accentColor": branding.accent_color if branding else "#0F172A",
+                    "themePreset": tokens["theme_preset"],
+                    "tokens": tokens,
                     "logoLightUrl": branding.logo_light_url if branding else None,
                     "logoDarkUrl": branding.logo_dark_url if branding else None,
                     "heroTaglineAr": branding.hero_tagline_ar if branding else None,
@@ -120,9 +136,18 @@ async def _build_public_storefront(db: AsyncSession, tenant: Tenant) -> dict:
     branding = (
         await db.execute(select(TenantBranding).where(TenantBranding.tenant_id == tenant.id))
     ).scalar_one_or_none()
-    halls = (await db.execute(select(Hall).where(Hall.tenant_id == tenant.id))).scalars().all()
+    halls = (
+        await db.execute(
+            select(Hall).where(Hall.tenant_id == tenant.id, Hall.lifecycle == RecordLifecycle.ACTIVE)
+        )
+    ).scalars().all()
     catering_items = (
-        await db.execute(select(CateringMenuItem).where(CateringMenuItem.tenant_id == tenant.id))
+        await db.execute(
+            select(CateringMenuItem).where(
+                CateringMenuItem.tenant_id == tenant.id,
+                CateringMenuItem.lifecycle == RecordLifecycle.ACTIVE,
+            )
+        )
     ).scalars().all()
     addon_items = (
         await db.execute(
@@ -138,6 +163,8 @@ async def _build_public_storefront(db: AsyncSession, tenant: Tenant) -> dict:
     meta = settings_dict.get("storefront_meta") or {}
     hall_media = settings_dict.get("hall_media") or {}
     offers = settings_dict.get("storefront_offers") or []
+    tokens = resolve_branding_tokens(settings_dict)
+    profile_media = settings_dict.get("profile_media") or {}
 
     return {
         "id": str(tenant.id),
@@ -163,6 +190,9 @@ async def _build_public_storefront(db: AsyncSession, tenant: Tenant) -> dict:
             "defaultTheme": branding.default_theme if branding else "DARK",
             "enableSpotlight": branding.enable_spotlight if branding else True,
             "spotlightColor": branding.spotlight_color if branding else "rgba(212, 175, 55, 0.18)",
+            "themePreset": tokens["theme_preset"],
+            "tokens": tokens,
+            "ownerAvatarUrl": profile_media.get("owner_avatar_url"),
             "logoLightUrl": branding.logo_light_url if branding else None,
             "logoDarkUrl": branding.logo_dark_url if branding else None,
             "faviconUrl": branding.favicon_url if branding else None,
@@ -189,10 +219,36 @@ async def _build_public_storefront(db: AsyncSession, tenant: Tenant) -> dict:
                 "capacity_theater": h.capacity_theater,
                 "base_price": float(h.base_price),
                 "cleaning_buffer_minutes": h.cleaning_buffer_minutes,
-                "combinable_with_hall_id": str(h.combinable_with_hall_id) if h.combinable_with_hall_id else None,
-                "gallery_urls": (hall_media.get(str(h.id)) or {}).get("gallery_urls") or [],
-                "video_url": (hall_media.get(str(h.id)) or {}).get("video_url"),
-                "amenities": (hall_media.get(str(h.id)) or {}).get("amenities") or [],
+                "combinable_with_hall_id": (
+                    lambda pids: str(pids[0]) if pids else None
+                )(AvailabilityService.resolve_combinable_partner_ids(halls, h.id)),
+                **(
+                    lambda hm: {
+                        "gallery_urls": list(
+                            dict.fromkeys(
+                                ([hm["cover_image_url"]] if hm.get("cover_image_url") else [])
+                                + (hm.get("gallery_urls") or [])
+                                + [
+                                    it.get("url")
+                                    for it in (hm.get("items") or [])
+                                    if isinstance(it, dict) and it.get("media_type") == "image" and it.get("url")
+                                ]
+                            )
+                        ),
+                        "video_url": hm.get("video_url")
+                        or next(
+                            (
+                                it.get("url")
+                                for it in (hm.get("items") or [])
+                                if isinstance(it, dict)
+                                and it.get("media_type") in ("video", "youtube")
+                                and it.get("url")
+                            ),
+                            None,
+                        ),
+                        "amenities": hm.get("amenities") or [],
+                    }
+                )(hall_media.get(str(h.id)) or {}),
             }
             for h in halls
         ],
@@ -221,10 +277,7 @@ async def _build_public_storefront(db: AsyncSession, tenant: Tenant) -> dict:
 
 @router.get("/public/tenants/{slug}")
 async def get_public_tenant_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
-    clean_slug = slug.strip().lower()
-    tenant = (
-        await db.execute(select(Tenant).where(Tenant.slug == clean_slug, Tenant.is_active == True))  # noqa: E712
-    ).scalar_one_or_none()
+    tenant = await resolve_active_tenant_by_slug(db, slug)
     if not tenant:
         raise HTTPException(status_code=404, detail="Venue workspace not found or inactive")
     return await _build_public_storefront(db, tenant)
@@ -232,10 +285,7 @@ async def get_public_tenant_by_slug(slug: str, db: AsyncSession = Depends(get_db
 
 @router.get("/public/tenants/{slug}/storefront")
 async def get_public_tenant_storefront(slug: str, db: AsyncSession = Depends(get_db)):
-    clean_slug = slug.strip().lower()
-    tenant = (
-        await db.execute(select(Tenant).where(Tenant.slug == clean_slug, Tenant.is_active == True))  # noqa: E712
-    ).scalar_one_or_none()
+    tenant = await resolve_active_tenant_by_slug(db, slug)
     if not tenant:
         raise HTTPException(status_code=404, detail="Venue workspace not found or inactive")
     return await _build_public_storefront(db, tenant)
@@ -254,7 +304,11 @@ async def list_all_tenants(
     for t in tenants:
         if t.is_active:
             active_tenants += 1
-        halls_count = (await db.execute(select(func.count(Hall.id)).where(Hall.tenant_id == t.id))).scalar() or 0
+        halls_count = (
+            await db.execute(
+                select(func.count(Hall.id)).where(Hall.tenant_id == t.id, Hall.lifecycle == RecordLifecycle.ACTIVE)
+            )
+        ).scalar() or 0
         events_count = (await db.execute(select(func.count(Event.id)).where(Event.tenant_id == t.id))).scalar() or 0
         users_count = (await db.execute(select(func.count(User.id)).where(User.tenant_id == t.id))).scalar() or 0
         gmv = float(
@@ -289,6 +343,7 @@ async def list_all_tenants(
                 "whatsapp_used_this_month": t.whatsapp_used_this_month,
                 "whatsapp_used": t.whatsapp_used_this_month,
                 "currency": t.currency,
+                "tax_rate": float(t.tax_rate),
                 "is_active": t.is_active,
                 "halls_count": halls_count,
                 "events_count": events_count,
@@ -323,6 +378,21 @@ async def update_tenant_admin(
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     updates = body.model_dump(exclude_none=True)
+    if "name" in updates:
+        updates["name"] = updates["name"].strip()
+    if "slug" in updates:
+        clean_slug = re.sub(r"[^a-z0-9-]", "", updates["slug"].lower().strip())
+        if len(clean_slug) < 3 or clean_slug in {"www", "admin", "api", "app", "mail", "static"}:
+            raise HTTPException(status_code=400, detail="Invalid or reserved tenant slug")
+        if clean_slug != tenant.slug:
+            dup = (
+                await db.execute(select(Tenant.id).where(Tenant.slug == clean_slug, Tenant.id != tenant.id))
+            ).scalar_one_or_none()
+            if dup:
+                raise HTTPException(status_code=409, detail="Subdomain slug is already taken")
+        updates["slug"] = clean_slug
+    if "currency" in updates:
+        updates["currency"] = updates["currency"].strip().upper()
     if "custom_domain" in updates:
         updates["custom_domain"] = updates["custom_domain"].strip().lower() or None
 

@@ -7,22 +7,26 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.tenant_middleware import resolve_active_tenant_by_slug
 from app.core.security import (
     AuthContext,
+    create_access_token,
     create_receipt_upload_token,
+    get_optional_auth,
     hash_password,
     require_roles,
+    verify_password,
     verify_receipt_upload_token,
 )
 from app.models.accounting import DepositStatus, Invoice, InvoiceStatus, PaymentMilestone
 from app.models.base import RecordLifecycle, utcnow
-from app.models.events import AuditLog, Event, EventStatus
-from app.models.events_extensions import EventContract
+from app.models.events import AuditLog, DraftStatus, DraftType, Event, EventDraft, EventStatus
+from app.models.events_extensions import EventContract, EventSecurityProfile
 from app.models.tenant import Tenant, TenantBranding
 from app.models.users import ClientCategory, ClientProfile, StaffRole, User, UserType
 from app.models.venue import CateringMenuItem, EventInventoryAllocation, Hall, InventoryItem, PricingRule
@@ -54,6 +58,19 @@ class HoldAddonItem(BaseModel):
     unit_price: Optional[Decimal] = Field(default=None, ge=0)
 
 
+class CustomCateringInput(BaseModel):
+    title: str = Field(..., min_length=2, max_length=200)
+    price_per_guest: Decimal = Field(default=Decimal("0.00"), ge=0)
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
+class CustomAddonInput(BaseModel):
+    title: str = Field(..., min_length=2, max_length=200)
+    quantity: int = Field(default=1, ge=1)
+    unit_price: Decimal = Field(default=Decimal("0.00"), ge=0)
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
 DEFAULT_PAYMENT_ACCOUNTS = [
     {"code": "KURAIMI_BANK", "labelAr": "بنك الكريمي", "labelEn": "Kuraimi Bank", "account": "301234567"},
     {"code": "JAIB_WALLET", "labelAr": "محفظة جيب", "labelEn": "Jaib Wallet", "account": "770000001"},
@@ -75,17 +92,25 @@ class PublicHoldBookingRequest(BaseModel):
     selected_payment_method: Optional[PaymentMethodCode] = None
     addons: list[HoldAddonItem] = Field(default_factory=list)
     hall_id: uuid.UUID
+    hall_ids: list[uuid.UUID] = Field(default_factory=list)
     merge_combinable_hall: bool = False
+    event_title: Optional[str] = Field(default=None, max_length=255)
     event_type: str = "WEDDING"
     start_time: datetime
     end_time: datetime
     guest_count: int = Field(default=250, ge=10)
     catering_item_id: Optional[uuid.UUID] = None
+    catering_guest_count: Optional[int] = Field(default=None, ge=0)
+    catering_notes: Optional[str] = Field(default=None, max_length=500)
+    custom_catering: Optional[CustomCateringInput] = None
+    custom_addons: list[CustomAddonInput] = Field(default_factory=list)
     offer_id: Optional[str] = None
     addon_amount: Decimal = Decimal("0.00")
     client_full_name: str = Field(..., min_length=2)
     client_phone: str = Field(..., min_length=7)
     client_email: Optional[str] = None
+    client_password: Optional[str] = Field(default=None, min_length=8)
+    client_auth_mode: Literal["REGISTER", "LOGIN", "GUEST_AUTO"] = "GUEST_AUTO"
     client_category: ClientCategory = ClientCategory.INDIVIDUAL_B2C
     company_name: Optional[str] = None
     tax_id: Optional[str] = None
@@ -95,6 +120,13 @@ class UpdateEventStatusBody(BaseModel):
     status: EventStatus
 
 
+class UpdateEventDetailsBody(BaseModel):
+    title: Optional[str] = Field(default=None, max_length=255)
+    event_type: Optional[str] = Field(default=None, max_length=50)
+    guest_count: Optional[int] = Field(default=None, ge=1)
+    remarks: Optional[str] = Field(default=None, max_length=500)
+
+
 async def _compute_addons(
     db: AsyncSession,
     tenant_id: uuid.UUID,
@@ -102,7 +134,8 @@ async def _compute_addons(
     guest_count: int,
     catering_item_id: Optional[uuid.UUID],
     merge_combinable_hall: bool,
-) -> tuple[Decimal, Decimal]:
+    hall_ids: Optional[list[uuid.UUID]] = None,
+) -> tuple[Decimal, Decimal, list[dict]]:
     catering_total = Decimal("0.00")
     if catering_item_id:
         cat_item = (
@@ -119,31 +152,39 @@ async def _compute_addons(
             )
 
     merged_hall_addon = Decimal("0.00")
-    if merge_combinable_hall:
-        primary_hall = (
-            await db.execute(select(Hall).where(Hall.id == hall_id, Hall.tenant_id == tenant_id))
-        ).scalar_one_or_none()
-        if primary_hall and primary_hall.combinable_with_hall_id:
-            partner_hall = (
-                await db.execute(
-                    select(Hall).where(
-                        Hall.id == primary_hall.combinable_with_hall_id,
-                        Hall.tenant_id == tenant_id,
-                    )
-                )
-            ).scalar_one_or_none()
-            if partner_hall:
-                merged_hall_addon = (Decimal(str(partner_hall.base_price)) * Decimal("0.85")).quantize(
-                    Decimal("0.01")
-                )
+    additional_halls: list[dict] = []
+    if merge_combinable_hall or (hall_ids and any(hid != hall_id for hid in hall_ids)):
+        requested_halls = await AvailabilityService.resolve_requested_halls(
+            db,
+            tenant_id,
+            hall_id,
+            hall_ids=hall_ids,
+            merge_combinable_hall=merge_combinable_hall,
+        )
+        for extra_hall in requested_halls[1:]:
+            eh_price = (Decimal(str(extra_hall.base_price)) * Decimal("0.85")).quantize(Decimal("0.01"))
+            merged_hall_addon += eh_price
+            additional_halls.append(
+                {
+                    "hall_id": str(extra_hall.id),
+                    "name": extra_hall.name,
+                    "name_ar": extra_hall.name_ar,
+                    "label_en": f"{extra_hall.name} (Combined Hall)",
+                    "label_ar": f"{extra_hall.name_ar} (قاعة مدمجة)",
+                    "quantity": 1,
+                    "unit_price": float(eh_price),
+                    "total": float(eh_price),
+                }
+            )
 
-    return catering_total, merged_hall_addon
+    return catering_total, merged_hall_addon, additional_halls
 
 
 @router.get("/public/halls/availability")
 async def get_public_availability_and_calendar(
     request: Request,
     hall_id: Optional[uuid.UUID] = Query(default=None),
+    hall_ids: Optional[str] = Query(default=None),
     start_time: Optional[datetime] = Query(default=None),
     end_time: Optional[datetime] = Query(default=None),
     merge_combinable_hall: bool = Query(default=False),
@@ -155,7 +196,9 @@ async def get_public_availability_and_calendar(
     if not tenant:
         raise HTTPException(status_code=400, detail="Tenant context required")
 
-    halls = (await db.execute(select(Hall).where(Hall.tenant_id == tenant.id))).scalars().all()
+    halls = (
+        await db.execute(select(Hall).where(Hall.tenant_id == tenant.id, Hall.lifecycle == RecordLifecycle.ACTIVE))
+    ).scalars().all()
     upcoming = (
         await db.execute(
             select(Event)
@@ -166,12 +209,14 @@ async def get_public_availability_and_calendar(
             .order_by(Event.start_time.asc())
         )
     ).scalars().all()
+    ev_halls_map = await AvailabilityService.load_event_hall_ids_map(db, tenant.id, upcoming, halls)
 
     calendar_blocks = [
         {
             "event_id": str(e.id),
             "event_code": e.event_code,
             "hall_id": str(e.hall_id),
+            "hall_ids": [str(hid) for hid in ev_halls_map.get(e.id, [e.hall_id])],
             "event_type": e.event_type,
             "status": e.status.value,
             "start_time": e.start_time.isoformat(),
@@ -189,12 +234,35 @@ async def get_public_availability_and_calendar(
 
     naive_start = _to_naive_utc(start_time)
     naive_end = _to_naive_utc(end_time)
-    if naive_end <= naive_start:
-        raise HTTPException(status_code=400, detail="end_time must be after start_time")
+    AvailabilityService.validate_booking_horizon(naive_start, naive_end)
 
-    avail = await AvailabilityService.check_hall_availability(db, tenant.id, hall_id, naive_start, naive_end)
-    catering_total, merged_hall_addon = await _compute_addons(
-        db, tenant.id, hall_id, guest_count, catering_item_id, merge_combinable_hall
+    parsed_hall_ids: list[uuid.UUID] = []
+    if hall_ids and hall_ids.strip():
+        for part in hall_ids.split(","):
+            clean_p = part.strip()
+            if clean_p:
+                try:
+                    parsed_hall_ids.append(uuid.UUID(clean_p))
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=f"Invalid hall UUID in hall_ids: {clean_p}") from exc
+
+    avail = await AvailabilityService.check_hall_availability(
+        db,
+        tenant.id,
+        hall_id,
+        naive_start,
+        naive_end,
+        hall_ids=parsed_hall_ids or None,
+        merge_combinable_hall=merge_combinable_hall,
+    )
+    catering_total, merged_hall_addon, additional_halls = await _compute_addons(
+        db,
+        tenant.id,
+        hall_id,
+        guest_count,
+        catering_item_id,
+        merge_combinable_hall,
+        hall_ids=parsed_hall_ids or None,
     )
 
     quote = await AvailabilityService.calculate_dynamic_quote(
@@ -202,6 +270,7 @@ async def get_public_availability_and_calendar(
     )
     quote["catering_total"] = float(catering_total)
     quote["merged_hall_addon"] = float(merged_hall_addon)
+    quote["additional_halls"] = additional_halls
 
     return {"availability": avail, "quote": quote, "occupied_slots": calendar_blocks}
 
@@ -210,6 +279,7 @@ async def get_public_availability_and_calendar(
 async def create_public_or_staff_48h_hold(
     body: PublicHoldBookingRequest,
     request: Request,
+    opt_auth: Optional[AuthContext] = Depends(get_optional_auth),
     db: AsyncSession = Depends(get_db),
 ):
     tenant = getattr(request.state, "tenant", None)
@@ -218,23 +288,35 @@ async def create_public_or_staff_48h_hold(
 
     naive_start = _to_naive_utc(body.start_time)
     naive_end = _to_naive_utc(body.end_time)
-    if naive_end <= naive_start:
-        raise HTTPException(status_code=400, detail="end_time must be after start_time")
+    AvailabilityService.validate_booking_horizon(naive_start, naive_end)
 
-    # Lock hall row(s) during booking creation to serialize concurrent bookings on the same hall
-    hall_row = (
-        await db.execute(select(Hall).where(Hall.id == body.hall_id, Hall.tenant_id == tenant.id).with_for_update())
-    ).scalar_one_or_none()
-    if not hall_row:
-        raise HTTPException(status_code=404, detail="Hall not found")
-    if hall_row.combinable_with_hall_id:
-        await db.execute(
-            select(Hall.id)
-            .where(Hall.id == hall_row.combinable_with_hall_id, Hall.tenant_id == tenant.id)
-            .with_for_update()
-        )
+    requested_halls = await AvailabilityService.resolve_requested_halls(
+        db,
+        tenant.id,
+        body.hall_id,
+        hall_ids=body.hall_ids or None,
+        merge_combinable_hall=body.merge_combinable_hall,
+    )
+    requested_hall_ids = [h.id for h in requested_halls]
+    hall_row = requested_halls[0]
 
-    avail = await AvailabilityService.check_hall_availability(db, tenant.id, body.hall_id, naive_start, naive_end)
+    # Lock all requested hall rows in deterministic order to serialize concurrent single/multi-hall bookings
+    await db.execute(
+        select(Hall.id)
+        .where(Hall.id.in_(sorted(requested_hall_ids)), Hall.tenant_id == tenant.id)
+        .order_by(Hall.id)
+        .with_for_update()
+    )
+
+    avail = await AvailabilityService.check_hall_availability(
+        db,
+        tenant.id,
+        body.hall_id,
+        naive_start,
+        naive_end,
+        hall_ids=requested_hall_ids,
+        merge_combinable_hall=body.merge_combinable_hall,
+    )
     if not avail["available"]:
         raise HTTPException(
             status_code=409,
@@ -244,41 +326,132 @@ async def create_public_or_staff_48h_hold(
     clean_phone = body.client_phone.strip()
     clean_email = body.client_email.strip().lower() if body.client_email else None
 
-    client_user = (
-        await db.execute(select(User).where(User.tenant_id == tenant.id, User.phone == clean_phone))
-    ).scalar_one_or_none()
+    client_user: Optional[User] = None
+    issued_token: Optional[str] = None
+
+    if (
+        opt_auth is not None
+        and opt_auth.user.tenant_id == tenant.id
+        and opt_auth.user.user_type in (UserType.CLIENT_PRIMARY, UserType.CLIENT_DELEGATE)
+    ):
+        client_user = opt_auth.user
+        client_user.last_login_at = utcnow()
+        issued_token = create_access_token(client_user.id, tenant.id, client_user.user_type, None)
 
     if not client_user:
-        phone_conflict = (await db.execute(select(User.id).where(User.phone == clean_phone))).scalar_one_or_none()
-        if phone_conflict:
-            raise HTTPException(status_code=409, detail="Phone number is already registered in another workspace")
-        if clean_email:
-            email_conflict = (await db.execute(select(User.id).where(User.email == clean_email))).scalar_one_or_none()
-            if email_conflict:
-                raise HTTPException(status_code=409, detail="Email is already registered in another workspace")
+        client_user = (
+            await db.execute(select(User).where(User.tenant_id == tenant.id, User.phone == clean_phone))
+        ).scalar_one_or_none()
+    if not client_user and clean_email:
+        client_user = (
+            await db.execute(select(User).where(User.tenant_id == tenant.id, User.email == clean_email))
+        ).scalar_one_or_none()
+
+    if client_user:
+        if not issued_token:
+            if body.client_auth_mode == "LOGIN":
+                if not body.client_password or not verify_password(body.client_password, client_user.password_hash):
+                    raise HTTPException(status_code=401, detail="Invalid password for this account")
+                client_user.last_login_at = utcnow()
+                issued_token = create_access_token(client_user.id, tenant.id, client_user.user_type, None)
+            elif body.client_password:
+                if verify_password(body.client_password, client_user.password_hash):
+                    client_user.last_login_at = utcnow()
+                    issued_token = create_access_token(client_user.id, tenant.id, client_user.user_type, None)
+                elif body.client_auth_mode == "REGISTER":
+                    raise HTTPException(
+                        status_code=401,
+                        detail="An account with this phone or email already exists in this venue. Please sign in as a returning client.",
+                    )
+    else:
+        resolved_pw_hash: Optional[str] = None
+        src_profile: Optional[ClientProfile] = None
+        if body.client_auth_mode == "LOGIN":
+            if not body.client_password:
+                raise HTTPException(status_code=401, detail="Password is required for returning client sign in")
+            ident_filters = [User.phone == clean_phone]
+            if clean_email:
+                ident_filters.append(User.email == clean_email)
+            other_clients = (
+                await db.execute(
+                    select(User).where(
+                        User.user_type.in_([UserType.CLIENT_PRIMARY, UserType.CLIENT_DELEGATE]),
+                        or_(*ident_filters),
+                        User.is_active == True,  # noqa: E712
+                    )
+                )
+            ).scalars().all()
+            matched_cand = next(
+                (c for c in other_clients if verify_password(body.client_password, c.password_hash)), None
+            )
+            if not matched_cand:
+                raise HTTPException(status_code=401, detail="Account not found or invalid password")
+            resolved_pw_hash = matched_cand.password_hash
+            src_profile = (
+                await db.execute(select(ClientProfile).where(ClientProfile.user_id == matched_cand.id))
+            ).scalar_one_or_none()
+        elif body.client_password:
+            resolved_pw_hash = hash_password(body.client_password)
+        else:
+            resolved_pw_hash = hash_password(secrets.token_urlsafe(24))
 
         client_user = User(
             tenant_id=tenant.id,
             user_type=UserType.CLIENT_PRIMARY,
             email=clean_email,
             phone=clean_phone,
-            password_hash=hash_password(secrets.token_urlsafe(24)),
+            password_hash=resolved_pw_hash,
             full_name=body.client_full_name.strip(),
             preferred_lang="ar",
+            last_login_at=utcnow() if body.client_password else None,
         )
         db.add(client_user)
         await db.flush()
         db.add(
             ClientProfile(
                 user_id=client_user.id,
-                client_category=body.client_category,
-                company_name=body.company_name,
-                tax_id=body.tax_id,
+                client_category=body.client_category if not src_profile else src_profile.client_category,
+                company_name=body.company_name or (src_profile.company_name if src_profile else None),
+                tax_id=body.tax_id or (src_profile.tax_id if src_profile else None),
+                national_id_or_cr=src_profile.national_id_or_cr if src_profile else None,
+                billing_address=src_profile.billing_address if src_profile else None,
+                refund_bank_details=src_profile.refund_bank_details if src_profile else None,
             )
         )
+        if body.client_password:
+            issued_token = create_access_token(client_user.id, tenant.id, client_user.user_type, None)
 
-    catering_total, merged_hall_addon = await _compute_addons(
-        db, tenant.id, body.hall_id, body.guest_count, body.catering_item_id, body.merge_combinable_hall
+    effective_cat_guests = body.catering_guest_count if body.catering_guest_count is not None else body.guest_count
+    selected_cat_item: Optional[CateringMenuItem] = None
+    catering_total = Decimal("0.00")
+    if body.catering_item_id:
+        selected_cat_item = (
+            await db.execute(
+                select(CateringMenuItem).where(
+                    CateringMenuItem.id == body.catering_item_id,
+                    CateringMenuItem.tenant_id == tenant.id,
+                    CateringMenuItem.lifecycle == RecordLifecycle.ACTIVE,
+                )
+            )
+        ).scalar_one_or_none()
+        if not selected_cat_item:
+            raise HTTPException(status_code=404, detail="Selected catering package not found or inactive")
+        catering_total = (Decimal(str(selected_cat_item.price_per_guest)) * Decimal(str(effective_cat_guests))).quantize(
+            Decimal("0.01")
+        )
+    elif body.custom_catering:
+        catering_total = (
+            Decimal(str(body.custom_catering.price_per_guest)) * Decimal(str(effective_cat_guests))
+        ).quantize(Decimal("0.01"))
+
+    _, merged_hall_addon, additional_halls = await _compute_addons(
+        db,
+        tenant.id,
+        body.hall_id,
+        body.guest_count,
+        None,
+        body.merge_combinable_hall,
+        hall_ids=requested_hall_ids,
     )
 
     # Enforce DB-authoritative pricing for addons and validate stock
@@ -305,6 +478,24 @@ async def create_public_or_staff_48h_hold(
         addons_total += (db_unit_price * Decimal(a.quantity)).quantize(Decimal("0.01"))
         verified_addons.append((inv_item, a.quantity, db_unit_price))
 
+    custom_addons_total = Decimal("0.00")
+    normalized_custom_addons: list[dict] = []
+    for ca in body.custom_addons:
+        unit_p = Decimal(str(ca.unit_price)).quantize(Decimal("0.01"))
+        line_t = (unit_p * Decimal(ca.quantity)).quantize(Decimal("0.01"))
+        custom_addons_total += line_t
+        normalized_custom_addons.append(
+            {
+                "title": ca.title.strip(),
+                "quantity": ca.quantity,
+                "unit_price": float(unit_p),
+                "line_total": float(line_t),
+                "notes": ca.notes.strip() if ca.notes else None,
+                "is_custom_other": True,
+            }
+        )
+    total_addons_amount = addons_total + custom_addons_total
+
     # Apply valid tenant storefront offer discount if offer_id provided
     discount_amount = Decimal("0.00")
     if body.offer_id:
@@ -319,7 +510,7 @@ async def create_public_or_staff_48h_hold(
                 tenant.id,
                 body.hall_id,
                 naive_start,
-                addon_amount=catering_total + merged_hall_addon + addons_total,
+                addon_amount=catering_total + merged_hall_addon + total_addons_amount,
                 discount_amount=Decimal("0.00"),
             )
             discount_amount = (Decimal(str(pre_disc["subtotal"])) * (disc_pct / Decimal("100.00"))).quantize(
@@ -342,13 +533,76 @@ async def create_public_or_staff_48h_hold(
         tenant.id,
         body.hall_id,
         naive_start,
-        addon_amount=catering_total + merged_hall_addon + addons_total,
+        addon_amount=catering_total + merged_hall_addon + total_addons_amount,
         discount_amount=discount_amount,
     )
     quote["catering_total"] = float(catering_total)
     quote["merged_hall_addon"] = float(merged_hall_addon)
-    quote["addons_total"] = float(addons_total)
+    quote["addons_total"] = float(total_addons_amount)
     quote["discount_amount"] = float(discount_amount)
+    quote["additional_halls"] = additional_halls
+
+    primary_adjusted = (
+        Decimal(str(quote["base_price"])) * Decimal(str(quote["effective_multiplier"]))
+    ).quantize(Decimal("0.01"))
+    line_items_payload = {
+        "hall_ids": [str(h.id) for h in requested_halls],
+        "hall": {
+            "hall_id": str(hall_row.id),
+            "name": hall_row.name,
+            "name_ar": hall_row.name_ar,
+            "label_en": hall_row.name,
+            "label_ar": hall_row.name_ar,
+            "quantity": 1,
+            "unit_price": float(primary_adjusted),
+            "total": float(primary_adjusted),
+            "base_price": quote["base_price"],
+            "effective_multiplier": quote["effective_multiplier"],
+        },
+        "additional_halls": additional_halls,
+        "merged_hall_addon": float(merged_hall_addon),
+        "catering": (
+            {
+                "catering_item_id": str(selected_cat_item.id),
+                "name_ar": selected_cat_item.name_ar,
+                "name_en": selected_cat_item.name_en,
+                "price_per_guest": float(selected_cat_item.price_per_guest),
+                "servings": effective_cat_guests,
+                "line_total": float(catering_total),
+                "notes": body.catering_notes.strip() if body.catering_notes else None,
+                "is_custom_other": False,
+            }
+            if selected_cat_item
+            else (
+                {
+                    "catering_item_id": None,
+                    "title": body.custom_catering.title.strip(),
+                    "price_per_guest": float(Decimal(str(body.custom_catering.price_per_guest)).quantize(Decimal("0.01"))),
+                    "servings": effective_cat_guests,
+                    "line_total": float(catering_total),
+                    "notes": body.custom_catering.notes.strip()
+                    if body.custom_catering.notes
+                    else (body.catering_notes.strip() if body.catering_notes else None),
+                    "is_custom_other": True,
+                }
+                if body.custom_catering
+                else None
+            )
+        ),
+        "addons": [
+            {
+                "item_id": str(item.id),
+                "name": item.name,
+                "category": item.category,
+                "quantity": q_res,
+                "unit_price": float(unit_p),
+                "line_total": float((unit_p * Decimal(q_res)).quantize(Decimal("0.01"))),
+            }
+            for item, q_res, unit_p in verified_addons
+        ],
+        "custom_addons": normalized_custom_addons,
+        "offer_id": body.offer_id,
+    }
 
     seq_year = utcnow().year
     event_code = await DoubleEntryService.next_sequence_number(db, tenant.id, "EVT", seq_year)
@@ -359,6 +613,7 @@ async def create_public_or_staff_48h_hold(
         hall_id=body.hall_id,
         primary_client_id=client_user.id,
         event_code=event_code,
+        title=body.event_title.strip() if body.event_title and body.event_title.strip() else None,
         event_type=body.event_type,
         start_time=naive_start,
         end_time=naive_end,
@@ -389,9 +644,22 @@ async def create_public_or_staff_48h_hold(
         security_deposit_amount=Decimal(str(quote["security_deposit_amount"])),
         deposit_status=DepositStatus.UNPAID,
         status=InvoiceStatus.ISSUED,
+        line_items_json=line_items_payload,
     )
     db.add(invoice)
     await db.flush()
+    db.add(
+        EventDraft(
+            tenant_id=tenant.id,
+            event_id=event.id,
+            created_by_id=client_user.id,
+            version_number=1,
+            draft_type=DraftType.PACKAGE_QUOTE,
+            payload=line_items_payload,
+            financial_delta=Decimal("0.00"),
+            status=DraftStatus.APPROVED_SYNCED,
+        )
+    )
 
     deposit_due = (Decimal(str(quote["total_amount"])) * Decimal("0.50")).quantize(Decimal("0.01"))
     balance_due = Decimal(str(quote["total_amount"])) - deposit_due
@@ -492,6 +760,7 @@ async def create_public_or_staff_48h_hold(
         "total_amount": float(invoice.total_amount),
         "security_deposit_amount": float(invoice.security_deposit_amount),
         "status": invoice.status.value,
+        "line_items": line_items_payload,
     }
     contract_out = {
         "id": str(contract.id),
@@ -511,15 +780,18 @@ async def create_public_or_staff_48h_hold(
                 "event_code": event_code,
                 "invoice_number": invoice_number,
                 "total_amount": quote["total_amount"],
-                "merged_halls": body.merge_combinable_hall,
+                "hall_ids": [str(h.id) for h in requested_halls],
+                "merged_halls": body.merge_combinable_hall or len(requested_halls) > 1,
                 "selected_payment_method": pay_method,
                 "payment_mode": body.payment_mode,
                 "catering_item_id": str(body.catering_item_id) if body.catering_item_id else None,
+                "custom_catering": line_items_payload["catering"],
                 "transfer_reference": transfer_ref,
                 "addons": [
-                    {"item_id": str(item.id), "quantity": qty, "unit_price": float(unit_p)}
-                    for item, qty, unit_p in verified_addons
+                    {"item_id": str(item.id), "quantity": q_res, "unit_price": float(unit_p)}
+                    for item, q_res, unit_p in verified_addons
                 ],
+                "custom_addons": normalized_custom_addons,
             },
         )
     )
@@ -540,16 +812,37 @@ async def create_public_or_staff_48h_hold(
     return {
         "event_id": str(event.id),
         "event_code": event.event_code,
+        "title": event.title,
         "client_id": str(client_user.id),
         "status": "HOLD_48H",
-        "portal_auth_hint": "OTP_LOGIN_REQUIRED",
+        "portal_auth_hint": "AUTHENTICATED" if issued_token else "OTP_LOGIN_REQUIRED",
+        "access_token": issued_token,
+        "user": (
+            {
+                "id": str(client_user.id),
+                "tenant_id": str(tenant.id),
+                "tenant_slug": tenant.slug,
+                "full_name": client_user.full_name,
+                "email": client_user.email,
+                "phone": client_user.phone,
+                "user_type": client_user.user_type.value,
+                "staff_role": None,
+                "preferred_lang": client_user.preferred_lang,
+                "is_2fa_enabled": client_user.is_2fa_enabled,
+            }
+            if issued_token
+            else None
+        ),
         "expires_in_hours": 48,
         "hold_expires_at": hold_expires.isoformat(),
+        "hall_ids": [str(h.id) for h in requested_halls],
         "quote": quote,
         "booking": {
             "event_id": str(event.id),
             "event_code": event.event_code,
+            "title": event.title,
             "hall_id": str(event.hall_id),
+            "hall_ids": [str(h.id) for h in requested_halls],
             "event_type": event.event_type,
             "status": "HOLD_48H",
             "start_time": naive_start.isoformat(),
@@ -578,26 +871,39 @@ async def get_three_month_calendar(
     months: int = Query(default=3, ge=1, le=12),
     db: AsyncSession = Depends(get_db),
 ):
-    first_day = start_date or datetime.now(timezone.utc).date()
+    today_utc = datetime.now(timezone.utc).date()
+    min_cal_date = date(today_utc.year, today_utc.month, 1)
+    max_cal_date = AvailabilityService.add_calendar_months(today_utc, AvailabilityService.MAX_BOOKING_HORIZON_MONTHS)
+    first_day = start_date or today_utc
+    if start_date and (start_date < min_cal_date or start_date > max_cal_date):
+        raise HTTPException(
+            status_code=400,
+            detail="Requested calendar start_date is outside the 5-year (60-month) booking window",
+        )
     total_days = 30 * months
     last_day = first_day + timedelta(days=total_days - 1)
     win_start = datetime.combine(first_day, time.min)
     win_end = datetime.combine(last_day + timedelta(days=1), time.min)
 
-    tq = select(Tenant).where(Tenant.is_active == True)  # noqa: E712
     if tenant_slug:
-        tq = tq.where(Tenant.slug == tenant_slug.strip().lower())
-    tenants = (await db.execute(tq.order_by(Tenant.name))).scalars().all()
-    if tenant_slug and not tenants:
-        raise HTTPException(status_code=404, detail="Venue workspace not found or inactive")
+        resolved = await resolve_active_tenant_by_slug(db, tenant_slug)
+        if not resolved:
+            raise HTTPException(status_code=404, detail="Venue workspace not found or inactive")
+        tenants = [resolved]
+    else:
+        tenants = (await db.execute(select(Tenant).where(Tenant.is_active == True).order_by(Tenant.name))).scalars().all()  # noqa: E712
     tenant_ids = [t.id for t in tenants]
 
-    halls, brandings, rules, events = [], {}, [], []
+    all_tenant_halls, halls, brandings, rules, events = [], [], {}, [], []
     if tenant_ids:
-        hq = select(Hall).where(Hall.tenant_id.in_(tenant_ids))
-        if hall_id:
-            hq = hq.where(Hall.id == hall_id)
-        halls = (await db.execute(hq)).scalars().all()
+        all_tenant_halls = (
+            await db.execute(
+                select(Hall)
+                .where(Hall.tenant_id.in_(tenant_ids), Hall.lifecycle == RecordLifecycle.ACTIVE)
+                .order_by(Hall.name.asc())
+            )
+        ).scalars().all()
+        halls = [h for h in all_tenant_halls if (not hall_id or h.id == hall_id)]
         brandings = {
             b.tenant_id: b
             for b in (
@@ -646,26 +952,26 @@ async def get_three_month_calendar(
         ).scalars().all():
             addons_by_tenant.setdefault(a.tenant_id, []).append(a)
 
-    all_halls = {h.id: h for h in halls}
-    # Combinable partners block each other; include them even when hall_id filter applied.
-    partner_of: dict[uuid.UUID, set[uuid.UUID]] = {h.id: set() for h in halls}
-    for h in halls:
-        if h.combinable_with_hall_id:
-            partner_of[h.id].add(h.combinable_with_hall_id)
-        for o in halls:
-            if o.combinable_with_hall_id == h.id:
-                partner_of[h.id].add(o.id)
+    halls_by_tenant: dict[uuid.UUID, list[Hall]] = {}
+    for h in all_tenant_halls:
+        halls_by_tenant.setdefault(h.tenant_id, []).append(h)
 
     events_by_hall: dict[uuid.UUID, list[Event]] = {}
+    events_by_tenant: dict[uuid.UUID, list[Event]] = {}
     for ev in events:
-        events_by_hall.setdefault(ev.hall_id, []).append(ev)
+        events_by_tenant.setdefault(ev.tenant_id, []).append(ev)
+    for tid, t_evs in events_by_tenant.items():
+        ev_halls_map = await AvailabilityService.load_event_hall_ids_map(
+            db, tid, t_evs, halls_by_tenant.get(tid, [])
+        )
+        for ev in t_evs:
+            for hid in ev_halls_map.get(ev.id, [ev.hall_id]):
+                events_by_hall.setdefault(hid, []).append(ev)
 
     days_out: dict[str, list[dict]] = {}
     for h in halls:
         buf = timedelta(minutes=h.cleaning_buffer_minutes or 0)
         relevant = list(events_by_hall.get(h.id, []))
-        for pid in partner_of[h.id]:
-            relevant.extend(events_by_hall.get(pid, []))
         hall_rules = [r for r in rules if r.tenant_id == h.tenant_id and (r.hall_id is None or r.hall_id == h.id)]
 
         entries = []
@@ -685,6 +991,19 @@ async def get_three_month_calendar(
                     continue
                 multiplier *= Decimal(str(r.multiplier))
             dynamic_price = (Decimal(str(h.base_price)) * multiplier).quantize(Decimal("0.01"))
+
+            if day < today_utc or day > max_cal_date:
+                entries.append(
+                    {
+                        "date": day.isoformat(),
+                        "status": "UNAVAILABLE",
+                        "dynamic_price": float(dynamic_price),
+                        "multiplier": float(multiplier),
+                        "occupied_events": [],
+                        "available_slots": [],
+                    }
+                )
+                continue
 
             day_events = [ev for ev in relevant if ev.start_time < day_end and ev.end_time > day_start]
             occupied = []
@@ -733,10 +1052,6 @@ async def get_three_month_calendar(
             )
         days_out[str(h.id)] = entries
 
-    halls_by_tenant: dict[uuid.UUID, list[Hall]] = {}
-    for h in all_halls.values():
-        halls_by_tenant.setdefault(h.tenant_id, []).append(h)
-
     def _branding(t: Tenant) -> dict:
         b = brandings.get(t.id)
         return {
@@ -746,9 +1061,14 @@ async def get_three_month_calendar(
             "logoDarkUrl": b.logo_dark_url if b else None,
         }
 
+    def _active_partner(tenant_halls: list[Hall], target_h: Hall) -> Optional[str]:
+        pids = AvailabilityService.resolve_combinable_partner_ids(tenant_halls, target_h.id)
+        return str(pids[0]) if pids else None
+
     return {
         "start_date": first_day.isoformat(),
         "end_date": last_day.isoformat(),
+        "max_horizon_date": max_cal_date.isoformat(),
         "months": months,
         "tenants": [
             {
@@ -787,9 +1107,7 @@ async def get_three_month_calendar(
                         "capacity_banquet": h.capacity_banquet,
                         "capacity_theater": h.capacity_theater,
                         "base_price": float(h.base_price),
-                        "combinable_with_hall_id": str(h.combinable_with_hall_id)
-                        if h.combinable_with_hall_id
-                        else None,
+                        "combinable_with_hall_id": _active_partner(halls_by_tenant.get(t.id, []), h),
                         "cleaning_buffer_minutes": h.cleaning_buffer_minutes,
                     }
                     for h in halls_by_tenant.get(t.id, [])
@@ -831,14 +1149,14 @@ async def upload_public_milestone_receipt(
         raise HTTPException(status_code=404, detail="Milestone not found")
     if not milestone.upload_token_jti or milestone.upload_token_jti != jti:
         raise HTTPException(status_code=403, detail="Upload token already used or revoked")
-    if milestone.status not in ("PENDING", "UNDER_REVIEW"):
+    if milestone.status not in ("PENDING", "UNDER_REVIEW", "RETURNED_FOR_AMENDMENT"):
         raise HTTPException(status_code=409, detail="Milestone no longer accepts receipts")
     milestone.upload_token_jti = None
     client_id = (
         await db.execute(
             select(Event.primary_client_id)
             .join(Invoice, Invoice.event_id == Event.id)
-            .where(Invoice.id == milestone.invoice_id)
+            .where(Invoice.id == milestone.invoice_id, Invoice.tenant_id == tenant.id, Event.tenant_id == tenant.id)
         )
     ).scalar_one_or_none()
     return await save_milestone_receipt(db, milestone, receipt, payment_method, transfer_reference, client_id)
@@ -862,23 +1180,104 @@ async def list_staff_events(
         i.event_id: i
         for i in (await db.execute(select(Invoice).where(Invoice.tenant_id == auth.tenant_id))).scalars().all()
     }
+    inv_ids = [i.id for i in invoices.values()]
+    paid_by_inv: dict[uuid.UUID, Decimal] = {}
+    if inv_ids:
+        ms_rows = (
+            await db.execute(
+                select(PaymentMilestone).where(
+                    PaymentMilestone.tenant_id == auth.tenant_id,
+                    PaymentMilestone.invoice_id.in_(inv_ids),
+                    PaymentMilestone.is_security_deposit == False,  # noqa: E712
+                )
+            )
+        ).scalars().all()
+        for m in ms_rows:
+            paid_by_inv[m.invoice_id] = paid_by_inv.get(m.invoice_id, Decimal("0.00")) + Decimal(str(m.paid_amount))
+    sec_profiles = {
+        sp.event_id: sp.security_status
+        for sp in (
+            await db.execute(select(EventSecurityProfile).where(EventSecurityProfile.tenant_id == auth.tenant_id))
+        )
+        .scalars()
+        .all()
+    }
+    active_halls_list = [h for h in halls.values() if h.lifecycle == RecordLifecycle.ACTIVE]
+    def _ev_hall_ids(ev_obj: Event) -> list[uuid.UUID]:
+        inv = invoices.get(ev_obj.id)
+        return AvailabilityService.extract_booked_hall_ids(ev_obj, inv.line_items_json if inv else None, active_halls_list)
+
     return [
         {
             "id": str(ev.id),
             "event_code": ev.event_code,
+            "title": ev.title,
             "event_type": ev.event_type,
             "hall_id": str(ev.hall_id),
-            "hall_name": halls[ev.hall_id].name if ev.hall_id in halls else "",
-            "hall_name_ar": halls[ev.hall_id].name_ar if ev.hall_id in halls else "",
+            "hall_ids": [str(hid) for hid in _ev_hall_ids(ev)],
+            "hall_name": " + ".join(halls[hid].name for hid in _ev_hall_ids(ev) if hid in halls) or "",
+            "hall_name_ar": " + ".join(halls[hid].name_ar for hid in _ev_hall_ids(ev) if hid in halls) or "",
+            "client_id": str(ev.primary_client_id),
             "client_name": clients[ev.primary_client_id].full_name if ev.primary_client_id in clients else "",
+            "client_phone": clients[ev.primary_client_id].phone if ev.primary_client_id in clients else "",
             "start_time": ev.start_time.isoformat(),
             "end_time": ev.end_time.isoformat(),
             "status": ev.status.value,
             "guest_count": ev.guest_count,
             "total_amount": float(invoices[ev.id].total_amount) if ev.id in invoices else 0.0,
+            "paid_amount": float(paid_by_inv.get(invoices[ev.id].id, Decimal("0.00"))) if ev.id in invoices else 0.0,
+            "security_deposit_amount": float(invoices[ev.id].security_deposit_amount) if ev.id in invoices else 0.0,
+            "deposit_status": invoices[ev.id].deposit_status.value if ev.id in invoices else "UNPAID",
+            "is_locked": bool(ev.is_locked),
+            "closed_at": ev.closed_at.isoformat() if ev.closed_at else None,
+            "closing_remarks": ev.closing_remarks,
+            "reopened_reason": ev.reopened_reason,
+            "security_status": sec_profiles.get(ev.id, "DRAFT"),
         }
         for ev in events
     ]
+
+
+@router.patch("/bookings/events/{event_id}")
+async def update_event_details(
+    event_id: uuid.UUID,
+    body: UpdateEventDetailsBody,
+    auth: AuthContext = Depends(
+        require_roles(
+            {UserType.INTERNAL_STAFF},
+            {StaffRole.OWNER, StaffRole.ADMIN, StaffRole.OPS_MANAGER, StaffRole.SALES_MANAGER, StaffRole.SALES},
+            required_perm=("bookings", "edit"),
+        )
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    ev = (
+        await db.execute(select(Event).where(Event.id == event_id, Event.tenant_id == auth.tenant_id))
+    ).scalar_one_or_none()
+    if not ev:
+        raise HTTPException(status_code=404, detail="Event not found")
+    old_val = {"title": ev.title, "event_type": ev.event_type, "guest_count": ev.guest_count}
+    if body.title is not None:
+        ev.title = body.title.strip() or None
+    if body.event_type is not None and body.event_type.strip():
+        ev.event_type = body.event_type.strip()
+    if body.guest_count is not None:
+        ev.guest_count = body.guest_count
+    new_val = {"title": ev.title, "event_type": ev.event_type, "guest_count": ev.guest_count, "remarks": body.remarks}
+    db.add(
+        AuditLog(
+            tenant_id=auth.tenant_id,
+            event_id=ev.id,
+            actor_id=auth.user.id,
+            action="EVENT_DETAILS_UPDATED",
+            old_value=old_val,
+            new_value=new_val,
+        )
+    )
+    await db.commit()
+    return {"status": "UPDATED", "event_id": str(ev.id), "title": ev.title, "event_type": ev.event_type, "guest_count": ev.guest_count}
 
 
 @router.post("/bookings/events/{event_id}/status")
@@ -888,7 +1287,7 @@ async def update_event_status(
     auth: AuthContext = Depends(
         require_roles(
             {UserType.INTERNAL_STAFF},
-            {StaffRole.OWNER, StaffRole.SALES_MANAGER, StaffRole.OPS_MANAGER, StaffRole.FINANCE},
+            {StaffRole.OWNER, StaffRole.ADMIN, StaffRole.SALES_MANAGER, StaffRole.OPS_MANAGER, StaffRole.FINANCE},
         )
     ),
     db: AsyncSession = Depends(get_db),

@@ -157,11 +157,16 @@ export function tenantPath(locale: string, slug: string | null | undefined, rout
   return `/${locale}/t/${slug.toLowerCase()}${cleanRoute}`;
 }
 
-export function dynamicHref(locale: string, basePath: string, id: string): string {
+export function dynamicHref(locale: string, basePath: string, id: string, explicitSlug?: string | null): string {
+  const cleanBase = basePath.startsWith('/') ? basePath : `/${basePath}`;
   if (isNativeBuild()) {
-    return `/${locale}${basePath}/_?id=${encodeURIComponent(id)}`;
+    return `/${locale}${cleanBase}/_?id=${encodeURIComponent(id)}`;
   }
-  return `/${locale}${basePath}/${encodeURIComponent(id)}`;
+  const slug = explicitSlug ?? getTenantSlug();
+  if (slug) {
+    return `/${locale}/t/${slug.toLowerCase()}${cleanBase}/${encodeURIComponent(id)}`;
+  }
+  return `/${locale}${cleanBase}/${encodeURIComponent(id)}`;
 }
 
 export interface FetchOptions {
@@ -246,6 +251,25 @@ export async function apiFetch<T = any>(
   return (await res.json()) as T;
 }
 
+export function localizedVenueName(rawName: string | null | undefined, locale: 'ar' | 'en'): string {
+  const raw = (rawName || '').trim();
+  if (!raw) return '';
+  const parts = raw
+    .split('|')
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (parts.length > 1) {
+    if (locale === 'ar') {
+      const arPart = parts.find((p) => /[\u0600-\u06FF]/.test(p));
+      if (arPart) return arPart;
+    } else {
+      const enPart = parts.find((p) => /[A-Za-z]/.test(p) && !/[\u0600-\u06FF]/.test(p));
+      if (enPart) return enPart;
+    }
+  }
+  return raw;
+}
+
 export async function downloadAuthorizedFile(path: string, filename: string): Promise<void> {
   const origin = getApiOrigin();
   const headers: Record<string, string> = {};
@@ -254,7 +278,10 @@ export async function downloadAuthorizedFile(path: string, filename: string): Pr
   const token = getAccessToken();
   if (token) headers['Authorization'] = `Bearer ${token}`;
 
-  const cleanPath = path.startsWith('/') ? path : `/${path}`;
+  let cleanPath = path.startsWith('/') ? path : `/${path}`;
+  if (!cleanPath.startsWith('/api/') && !cleanPath.startsWith('/uploads/') && !cleanPath.startsWith('/media/')) {
+    cleanPath = `/api/v1${cleanPath}`;
+  }
   const res = await fetch(`${origin}${cleanPath}`, { headers });
   if (!res.ok) throw new ApiError(res.status, 'Download failed');
   const blob = await res.blob();

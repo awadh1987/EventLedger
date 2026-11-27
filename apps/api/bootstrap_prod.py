@@ -11,6 +11,7 @@ from app.models.base import Base
 import app.models.accounting  # noqa: F401
 import app.models.events  # noqa: F401
 import app.models.events_extensions  # noqa: F401
+import app.models.governance  # noqa: F401
 import app.models.tenant  # noqa: F401
 import app.models.venue  # noqa: F401
 from app.models.users import User, UserType
@@ -34,7 +35,9 @@ async def bootstrap_production() -> None:
 
     async with AsyncSessionLocal() as db:
         existing = (
-            await db.execute(select(User).where((User.email == email) | (User.phone == phone)))
+            await db.execute(
+                select(User).where(User.user_type == UserType.SUPER_ADMIN, (User.email == email) | (User.phone == phone))
+            )
         ).scalar_one_or_none()
         if existing:
             print(f"Platform SUPER_ADMIN already exists: {existing.email or existing.phone}")

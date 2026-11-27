@@ -5,8 +5,9 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 _TEST_DB = os.path.join(tempfile.gettempdir(), "eventledger_test.db")
-os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{_TEST_DB}")
-os.environ.setdefault("DEBUG", "true")
+os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TEST_DB}"
+os.environ["APP_ENV"] = "test"
+os.environ["DEBUG"] = "true"
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -30,6 +31,7 @@ from seed import seed_all
 
 
 async def _reset_and_seed_db() -> None:
+    assert "sqlite" in str(engine.url), f"Refusing destructive reset on non-SQLite DB: {engine.url}"
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)

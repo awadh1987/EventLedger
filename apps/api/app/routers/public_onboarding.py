@@ -12,10 +12,12 @@ from app.core.database import get_db
 from app.core.security import create_access_token, hash_password
 from app.models.accounting import AccountingConfig, AccountType, ChartOfAccount, default_normal_balance
 from app.models.base import utcnow
-from app.models.tenant import SubscriptionTier, SystemLookup, Tenant, TenantBranding
+from app.models.tenant import RecordLifecycle, SubscriptionTier, SystemLookup, Tenant, TenantBranding
 from app.models.users import StaffProfile, StaffRole, User, UserType
-from app.models.venue import Hall
+from app.models.venue import CateringMenuItem, Hall, InventoryItem, PricingRule
 from app.services.accounting_service import DoubleEntryService
+from app.services.availability_service import AvailabilityService
+from app.routers.tenant_settings import resolve_branding_tokens
 
 router = APIRouter(prefix="/api/v1/public", tags=["Public & SaaS Onboarding"])
 
@@ -49,6 +51,100 @@ DEFAULT_LOOKUPS = [
     ("DEPARTMENT", "SECURITY", "الأمن والبوابات", "Security", 4),
     ("DEPARTMENT", "SALES", "المبيعات", "Sales", 5),
 ]
+
+
+async def ensure_tenant_catalog_defaults(db: AsyncSession, tenant_id, currency: str = "YER") -> dict:
+    cur = (currency or "YER").strip().upper()
+    factor = Decimal("500") if cur == "YER" else (Decimal("3.75") if cur == "SAR" else Decimal("1"))
+
+    def _amt(usd_val: str) -> Decimal:
+        return (Decimal(usd_val) * factor).quantize(Decimal("0.01"))
+
+    added = {"lookups": 0, "catering": 0, "inventory": 0, "pricing_rules": 0}
+
+    existing_lookups = {
+        (r.category, r.code)
+        for r in (
+            await db.execute(select(SystemLookup).where(SystemLookup.tenant_id == tenant_id))
+        ).scalars().all()
+    }
+    for cat, code, ar, en, order in DEFAULT_LOOKUPS:
+        if (cat, code) not in existing_lookups:
+            db.add(
+                SystemLookup(
+                    tenant_id=tenant_id,
+                    category=cat,
+                    code=code,
+                    label_ar=ar,
+                    label_en=en,
+                    sort_order=order,
+                )
+            )
+            added["lookups"] += 1
+
+    has_catering = (
+        await db.execute(select(CateringMenuItem.id).where(CateringMenuItem.tenant_id == tenant_id).limit(1))
+    ).scalar_one_or_none()
+    if not has_catering:
+        catering_defaults = [
+            ("البوفيه الملكي اليمني الفاخر", "Royal Yemeni Banquet Buffet", "9.00", "5.00"),
+            ("بوفيه المؤتمرات والضيافة التنفيذية", "Executive Coffee & Pastry Buffet", "5.00", "2.60"),
+            ("وليمة المندي والمأكولات البحرية الكبرى", "Imperial Mandi & Seafood Feast", "13.00", "7.20"),
+        ]
+        for ar, en, ppg, cpg in catering_defaults:
+            db.add(
+                CateringMenuItem(
+                    tenant_id=tenant_id,
+                    name_ar=ar,
+                    name_en=en,
+                    price_per_guest=_amt(ppg),
+                    cost_per_guest=_amt(cpg),
+                    lifecycle=RecordLifecycle.ACTIVE,
+                )
+            )
+            added["catering"] += 1
+
+    has_inventory = (
+        await db.execute(select(InventoryItem.id).where(InventoryItem.tenant_id == tenant_id).limit(1))
+    ).scalar_one_or_none()
+    if not has_inventory:
+        inv_defaults = [
+            ("كوشة ملكية وتنسيق زهور | Royal Stage & Floral Arch", "DECOR", 4, "240.00"),
+            ("شاشة عرض LED 4K | LED 4K Video Wall", "AV_LIGHTING", 6, "190.00"),
+            ("نظام صوتيات احترافي وميكروفونات | Concert Audio & Wireless Mics", "AV_LIGHTING", 8, "120.00"),
+            ("استقبال السجادة الحمراء وخدمة صف السيارات | Red Carpet & Valet", "DECOR", 10, "90.00"),
+            ("طاولة ضيافة إضافية (10 مقاعد) | Extra Banquet Table (10 Seats)", "FURNITURE", 60, "16.00"),
+        ]
+        for name, cat, stock, price in inv_defaults:
+            db.add(
+                InventoryItem(
+                    tenant_id=tenant_id,
+                    name=name,
+                    category=cat,
+                    total_stock=stock,
+                    unit_addon_price=_amt(price),
+                    lifecycle=RecordLifecycle.ACTIVE,
+                )
+            )
+            added["inventory"] += 1
+
+    has_rules = (
+        await db.execute(select(PricingRule.id).where(PricingRule.tenant_id == tenant_id).limit(1))
+    ).scalar_one_or_none()
+    if not has_rules:
+        db.add(
+            PricingRule(
+                tenant_id=tenant_id,
+                hall_id=None,
+                name="تعرفة ذروة نهاية الأسبوع (الخميس والجمعة) / Weekend Peak Rate",
+                days_of_week=[4, 5],
+                multiplier=Decimal("1.15"),
+                is_active=True,
+            )
+        )
+        added["pricing_rules"] += 1
+
+    return added
 
 
 async def seed_tenant_defaults(db: AsyncSession, tenant_id) -> None:
@@ -99,18 +195,8 @@ async def seed_tenant_defaults(db: AsyncSession, tenant_id) -> None:
     )
 
     await DoubleEntryService.ensure_fiscal_year_with_periods(db, tenant_id, utcnow().year)
-
-    for cat, code, ar, en, order in DEFAULT_LOOKUPS:
-        db.add(
-            SystemLookup(
-                tenant_id=tenant_id,
-                category=cat,
-                code=code,
-                label_ar=ar,
-                label_en=en,
-                sort_order=order,
-            )
-        )
+    currency = (await db.execute(select(Tenant.currency).where(Tenant.id == tenant_id))).scalar_one_or_none() or "YER"
+    await ensure_tenant_catalog_defaults(db, tenant_id, currency)
 
 
 class TenantRegisterRequest(BaseModel):
@@ -250,6 +336,7 @@ async def get_public_tenant(request: Request, db: AsyncSession = Depends(get_db)
     branding = (
         await db.execute(select(TenantBranding).where(TenantBranding.tenant_id == tenant.id))
     ).scalar_one_or_none()
+    tokens = resolve_branding_tokens(tenant.settings)
     return {
         "id": str(tenant.id),
         "name": tenant.name,
@@ -266,6 +353,8 @@ async def get_public_tenant(request: Request, db: AsyncSession = Depends(get_db)
             "logo_light_url": branding.logo_light_url if branding else None,
             "logo_dark_url": branding.logo_dark_url if branding else None,
             "favicon_url": branding.favicon_url if branding else None,
+            "theme_preset": tokens["theme_preset"],
+            "tokens": tokens,
         },
     }
 
@@ -275,7 +364,11 @@ async def list_public_halls(request: Request, db: AsyncSession = Depends(get_db)
     tenant = getattr(request.state, "tenant", None)
     if not tenant:
         raise HTTPException(status_code=400, detail="Tenant context required")
-    halls = (await db.execute(select(Hall).where(Hall.tenant_id == tenant.id))).scalars().all()
+    halls = (
+        await db.execute(
+            select(Hall).where(Hall.tenant_id == tenant.id, Hall.lifecycle == RecordLifecycle.ACTIVE)
+        )
+    ).scalars().all()
     return [
         {
             "id": str(h.id),
@@ -285,7 +378,9 @@ async def list_public_halls(request: Request, db: AsyncSession = Depends(get_db)
             "capacity_theater": h.capacity_theater,
             "base_price": float(h.base_price),
             "cleaning_buffer_minutes": h.cleaning_buffer_minutes,
-            "combinable_with_hall_id": str(h.combinable_with_hall_id) if h.combinable_with_hall_id else None,
+            "combinable_with_hall_id": (
+                lambda pids: str(pids[0]) if pids else None
+            )(AvailabilityService.resolve_combinable_partner_ids(halls, h.id)),
         }
         for h in halls
     ]

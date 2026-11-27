@@ -11,6 +11,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Integer,
+    JSON,
     Numeric,
     String,
     Text,
@@ -175,16 +176,23 @@ class JournalLine(UUIDPkMixin, TenantOwnedMixin, Base):
 
 class Invoice(UUIDPkMixin, TenantOwnedMixin, Base):
     __tablename__ = "invoices"
+    __table_args__ = (UniqueConstraint("tenant_id", "invoice_number", name="uq_invoices_tenant_number"),)
 
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"), index=True)
-    invoice_number: Mapped[str] = mapped_column(String(60), unique=True)
+    invoice_number: Mapped[str] = mapped_column(String(60), index=True)
     subtotal: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    discount_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=Decimal("0.00"))
     discount_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"))
     tax_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"))
     total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     security_deposit_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"))
     deposit_status: Mapped[DepositStatus] = mapped_column(Enum(DepositStatus), default=DepositStatus.UNPAID)
     status: Mapped[InvoiceStatus] = mapped_column(Enum(InvoiceStatus), default=InvoiceStatus.DRAFT)
+    line_items_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    refund_voucher_number: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    refund_payment_method: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    refund_reference: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    refund_journal_entry_id: Mapped[Optional[uuid.UUID]] = mapped_column(Uuid, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -201,6 +209,7 @@ class PaymentMilestone(UUIDPkMixin, TenantOwnedMixin, Base):
     is_security_deposit: Mapped[bool] = mapped_column(Boolean, default=False)
     upload_token_jti: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="PENDING")
+    reviewer_remarks: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 

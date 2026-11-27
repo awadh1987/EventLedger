@@ -1,5 +1,6 @@
 import os
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -13,10 +14,13 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import AuthContext, get_accessible_event_ids, get_current_auth, verify_event_access
 from app.models.accounting import Invoice, PaymentMilestone
-from app.models.events import AuditLog, Event
+from app.models.events import AuditLog, Event, EventStatus
+from app.models.events_extensions import DamageInspection, EventSecurityProfile
 from app.models.tenant import Tenant
 from app.models.users import ClientCategory, ClientProfile, DelegateRole, EventDelegate, User, UserType
 from app.models.venue import Hall
+from app.services.availability_service import AvailabilityService
+from app.services.comms_service import CommsService
 
 portal_router = APIRouter(prefix="/api/v1/portal", tags=["Client Account Control Panel"])
 
@@ -168,14 +172,47 @@ async def list_portal_events(auth: AuthContext = Depends(get_current_auth), db: 
         events = list(events_by_id.values())
 
     out = []
+    sec_by_ev = {
+        sp.event_id: sp.security_status
+        for sp in (
+            await db.execute(select(EventSecurityProfile).where(EventSecurityProfile.tenant_id == auth.tenant_id))
+        )
+        .scalars()
+        .all()
+    }
+    insp_by_ev = {
+        di.event_id: di
+        for di in (
+            await db.execute(select(DamageInspection).where(DamageInspection.tenant_id == auth.tenant_id))
+        )
+        .scalars()
+        .all()
+    }
+    inv_by_ev = {
+        inv.event_id: inv
+        for inv in (
+            await db.execute(
+                select(Invoice).where(
+                    Invoice.tenant_id == auth.tenant_id,
+                    Invoice.event_id.in_([e.id for e in events]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    } if events else {}
+    active_halls_list = [h for h in halls.values() if getattr(h, "lifecycle", None) is None or h.lifecycle.value == "ACTIVE"]
     for ev in events:
         my_role, perms = role_map[ev.id]
+        inv = inv_by_ev.get(ev.id)
+        ev_hall_ids = AvailabilityService.extract_booked_hall_ids(
+            ev, inv.line_items_json if inv else None, active_halls_list
+        )
         hall = halls.get(ev.hall_id)
+        combined_hall_en = " + ".join(halls[hid].name for hid in ev_hall_ids if hid in halls) or (hall.name if hall else "")
+        combined_hall_ar = " + ".join(halls[hid].name_ar for hid in ev_hall_ids if hid in halls) or (hall.name_ar if hall else "")
         inv_payload = None
         if perms.get("canViewFinance", my_role == "PRIMARY"):
-            inv = (
-                await db.execute(select(Invoice).where(Invoice.event_id == ev.id, Invoice.tenant_id == auth.tenant_id))
-            ).scalar_one_or_none()
             if inv:
                 milestones = (
                     await db.execute(
@@ -188,12 +225,16 @@ async def list_portal_events(auth: AuthContext = Depends(get_current_auth), db: 
                     "id": str(inv.id),
                     "invoice_number": inv.invoice_number,
                     "subtotal": float(inv.subtotal),
+                    "discount_percent": float(getattr(inv, "discount_percent", 0) or 0),
                     "discount_amount": float(inv.discount_amount),
                     "tax_amount": float(inv.tax_amount),
                     "total_amount": float(inv.total_amount),
                     "security_deposit_amount": float(inv.security_deposit_amount),
                     "deposit_status": inv.deposit_status.value,
+                    "refund_voucher_number": getattr(inv, "refund_voucher_number", None),
+                    "refund_payment_method": getattr(inv, "refund_payment_method", None),
                     "status": inv.status.value,
+                    "line_items": inv.line_items_json,
                     "milestones": [
                         {
                             "id": str(m.id),
@@ -204,24 +245,50 @@ async def list_portal_events(auth: AuthContext = Depends(get_current_auth), db: 
                             "payment_method": m.payment_method,
                             "receipt_url": m.receipt_url,
                             "status": m.status,
+                            "reviewer_remarks": getattr(m, "reviewer_remarks", None),
                             "is_security_deposit": bool(m.is_security_deposit),
                         }
                         for m in milestones
                     ],
                 }
+        di = insp_by_ev.get(ev.id)
         out.append(
             {
                 "id": str(ev.id),
                 "event_code": ev.event_code,
+                "title": ev.title,
                 "event_type": ev.event_type,
                 "hall_id": str(ev.hall_id),
-                "hall_name": hall.name if hall else "",
-                "hall_name_ar": hall.name_ar if hall else "",
+                "hall_ids": [str(hid) for hid in ev_hall_ids],
+                "hall_name": combined_hall_en,
+                "hall_name_ar": combined_hall_ar,
                 "start_time": ev.start_time.isoformat(),
                 "end_time": ev.end_time.isoformat(),
                 "status": ev.status.value,
+                "created_at": ev.created_at.isoformat(),
+                "hold_expires_at": (
+                    (ev.created_at + timedelta(hours=48)).isoformat()
+                    if ev.status == EventStatus.HOLD_48H
+                    else None
+                ),
                 "guest_count": ev.guest_count,
                 "is_locked": ev.is_locked,
+                "closed_at": ev.closed_at.isoformat() if ev.closed_at else None,
+                "closing_remarks": ev.closing_remarks,
+                "security_status": sec_by_ev.get(ev.id, "DRAFT"),
+                "inspection": (
+                    {
+                        "status": di.status.value,
+                        "approval_status": di.approval_status,
+                        "deduction_amount": float(di.deduction_amount),
+                        "deduction_items": di.deduction_items_json or [],
+                        "notes": di.notes,
+                        "client_remarks": di.client_remarks,
+                        "amendment_remarks": di.amendment_remarks,
+                    }
+                    if di
+                    else None
+                ),
                 "my_role": my_role,
                 "permissions": perms,
                 "invoice": inv_payload,
@@ -418,6 +485,7 @@ async def save_milestone_receipt(
 
     milestone.receipt_url = f"/api/v1/portal/milestones/{milestone.id}/receipt?file={fname}"
     milestone.status = "UNDER_REVIEW"
+    milestone.reviewer_remarks = None
     milestone.upload_token_jti = None
     if payment_method and payment_method.strip():
         milestone.payment_method = payment_method.strip()[:60]
@@ -433,6 +501,19 @@ async def save_milestone_receipt(
                 new_value={"milestone_id": str(milestone.id), "transfer_reference": ref or None},
             )
         )
+    inv_row = (
+        await db.execute(select(Invoice).where(Invoice.id == milestone.invoice_id, Invoice.tenant_id == milestone.tenant_id))
+    ).scalar_one_or_none()
+    await CommsService.notify_and_whatsapp(
+        db,
+        milestone.tenant_id,
+        title=f"تم رفع إيصال دفع للمراجعة · {milestone.title[:40]}",
+        content=f"قام العميل برفع إيصال سداد ({milestone.amount_due}) وهو قيد المراجعة المحاسبية.",
+        category="PAYMENT_PROOF_UPLOADED",
+        event_id=inv_row.event_id if inv_row else None,
+        recipient_user_id=None,
+        send_whatsapp=False,
+    )
     await db.commit()
     return {
         "status": "UNDER_REVIEW",
@@ -468,6 +549,8 @@ async def upload_milestone_receipt(
     ).scalar_one_or_none()
     if not milestone:
         raise HTTPException(status_code=404, detail="Milestone not found")
+    if milestone.status == "PAID":
+        raise HTTPException(status_code=409, detail="Milestone is already verified and paid")
     inv = (
         await db.execute(select(Invoice).where(Invoice.id == milestone.invoice_id, Invoice.tenant_id == auth.tenant_id))
     ).scalar_one_or_none()

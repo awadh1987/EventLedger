@@ -8,10 +8,12 @@ import {
   CheckCircle2,
   ClipboardCheck,
   Clock,
+  Edit3,
   GitCompare,
   Layers,
   Palette,
   Search,
+  Send,
   ShieldCheck,
   TrendingUp,
   Users,
@@ -20,14 +22,39 @@ import {
 } from 'lucide-react';
 import { AppHeader } from '@/components/layout/AppHeader';
 import { MobileBottomNav } from '@/components/layout/MobileBottomNav';
+import { useNavigationHistory } from '@/components/navigation/NavigationHistoryProvider';
 import { useAuthSession } from '@/components/providers/auth-provider';
+import { CatalogControlPlane } from '@/components/erp/CatalogControlPlane';
+import { ClientAccountsControlPanel, type RichClientRow } from '@/components/erp/ClientAccountsControlPanel';
+import { InvoicingAndContractsPanel, type ErpInvoiceDetail } from '@/components/erp/InvoicingAndContractsPanel';
+import { OutlookHallCalendar, type CalendarEventRow } from '@/components/erp/OutlookHallCalendar';
+import { SecurityAndCloseControlPlane, type SecuritySubTab } from '@/components/erp/SecurityAndCloseControlPlane';
+import { BackButton } from '@/components/ui/BackButton';
 import { ResponsiveDataList } from '@/components/ui/ResponsiveDataList';
 import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
-import { apiFetch, dynamicHref, tenantPath } from '@/lib/api';
+import { apiFetch, getAccessToken, tenantPath } from '@/lib/api';
 import type { HallInfo } from '@/lib/types';
 
-type ErpTab = 'SCHEDULE' | 'CATALOG' | 'INVOICING' | 'OPERATIONS' | 'CLIENTS' | 'BRANDING';
-type CalView = 'MONTH' | 'WEEK' | 'AGENDA';
+type ErpTab = 'SCHEDULE' | 'CATALOG' | 'INVOICING' | 'OPERATIONS' | 'SECURITY' | 'CLIENTS' | 'BRANDING' | 'GOVERNANCE';
+
+interface GovernanceRequestRow {
+  id: string;
+  tenant_id: string | null;
+  tenant_name: string | null;
+  tenant_slug: string | null;
+  scope: 'TENANT_ADMIN' | 'SUPER_ADMIN';
+  target_entity_type: 'EVENT' | 'CLIENT' | 'TENANT';
+  target_entity_id: string;
+  request_title: string;
+  current_values: Record<string, unknown>;
+  proposed_values: Record<string, unknown>;
+  status: string;
+  requester_name: string;
+  requester_remarks: string | null;
+  reviewer_name: string | null;
+  reviewer_remarks: string | null;
+  created_at: string;
+}
 
 interface TenantClientRow {
   id: string;
@@ -49,6 +76,7 @@ interface TenantClientRow {
 interface StaffEventRow {
   id: string;
   event_code: string;
+  title?: string | null;
   event_type: string;
   hall_id: string;
   hall_name: string;
@@ -108,7 +136,8 @@ const STATUS_STYLE: Record<string, string> = {
   CONFIRMED: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-600 dark:text-emerald-300',
   HOLD_48H: 'border-amber-500/40 bg-amber-500/15 text-amber-600 dark:text-amber-300',
   CONTRACT_PENDING: 'border-sky-500/40 bg-sky-500/15 text-sky-600 dark:text-sky-300',
-  COMPLETED: 'border-slate-500/40 bg-slate-500/15 text-slate-600 dark:text-slate-300',
+  COMPLETED: 'border-indigo-500/40 bg-indigo-500/15 text-indigo-600 dark:text-indigo-300',
+  CLOSED: 'border-slate-500/50 bg-slate-500/20 text-slate-700 dark:text-slate-200',
   CANCELLED: 'border-rose-500/40 bg-rose-500/15 text-rose-600 dark:text-rose-300',
 };
 
@@ -118,32 +147,34 @@ export default function ErpDashboardPage() {
   const isRtl = locale === 'ar';
   const tr = (ar: string, en: string) => (isRtl ? ar : en);
   const { tenantSlug } = useAuthSession();
+  const { currentSearch } = useNavigationHistory();
 
   const [activeTab, setActiveTab] = useState<ErpTab>('SCHEDULE');
-  const [calView, setCalView] = useState<CalView>('AGENDA');
-  const [hallFilter, setHallFilter] = useState<string>('ALL');
-  const [searchQuery, setSearchQuery] = useState('');
+  const [securityInitialSubTab, setSecurityInitialSubTab] = useState<SecuritySubTab>('READINESS');
 
-  const [events, setEvents] = useState<StaffEventRow[]>([]);
+  useEffect(() => {
+    if (!currentSearch) return;
+    const t = new URLSearchParams(currentSearch).get('tab');
+    if (
+      t === 'SCHEDULE' ||
+      t === 'CATALOG' ||
+      t === 'INVOICING' ||
+      t === 'OPERATIONS' ||
+      t === 'SECURITY' ||
+      t === 'CLIENTS' ||
+      t === 'BRANDING' ||
+      t === 'GOVERNANCE'
+    ) {
+      setActiveTab(t);
+    }
+  }, [currentSearch]);
+
+  const [events, setEvents] = useState<CalendarEventRow[]>([]);
   const [halls, setHalls] = useState<HallInfo[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRow[]>([]);
-  const [invoices, setInvoices] = useState<InvoiceRow[]>([]);
-  const [inventory, setInventory] = useState<InventoryRow[]>([]);
-  const [clients, setClients] = useState<TenantClientRow[]>([]);
-  const [clientSearch, setClientSearch] = useState('');
-  const [clientFilter, setClientFilter] = useState<'ALL' | 'INDIVIDUAL_B2C' | 'CORPORATE_B2B' | 'SUSPENDED'>('ALL');
-  const [managedClient, setManagedClient] = useState<TenantClientRow | null>(null);
-  const [clientForm, setClientForm] = useState({
-    full_name: '',
-    phone: '',
-    is_active: true,
-    vip_tier: 'STANDARD',
-    client_category: 'INDIVIDUAL_B2C' as 'INDIVIDUAL_B2C' | 'CORPORATE_B2B',
-    company_name: '',
-    tax_id: '',
-    national_id_or_cr: '',
-  });
-  const [clientNewPassword, setClientNewPassword] = useState('');
+  const [invoices, setInvoices] = useState<ErpInvoiceDetail[]>([]);
+  const [clients, setClients] = useState<RichClientRow[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
   const [branding, setBranding] = useState({
     primary_color: '#D4AF37',
     accent_color: '#0F172A',
@@ -155,11 +186,26 @@ export default function ErpDashboardPage() {
   const [selectedEventId, setSelectedEventId] = useState<string>('');
   const [selectedApprovalId, setSelectedApprovalId] = useState<string>('');
   const [rejectionReason, setRejectionReason] = useState('');
+  const [governanceReqs, setGovernanceReqs] = useState<GovernanceRequestRow[]>([]);
+  const [govRemarksMap, setGovRemarksMap] = useState<Record<string, string>>({});
+  const [editingTitleEventId, setEditingTitleEventId] = useState<string | null>(null);
+  const [titleDraft, setTitleDraft] = useState('');
+  const [titleRemarks, setTitleRemarks] = useState('');
+  const [tenantGovForm, setTenantGovForm] = useState({
+    name: '',
+    slug: '',
+    custom_domain: '',
+    currency: '',
+    tax_rate: '',
+    remarks: '',
+  });
+  const [resubmitTenantId, setResubmitTenantId] = useState<string | null>(null);
+  const [resubmitRemarks, setResubmitRemarks] = useState('');
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Post-Event Damage Inspection modal state
-  const [inspectEvent, setInspectEvent] = useState<StaffEventRow | null>(null);
+  const [inspectEvent, setInspectEvent] = useState<CalendarEventRow | null>(null);
   const [inspectStatus, setInspectStatus] = useState<'PASSED' | 'DAMAGE_CLAIMED'>('PASSED');
   const [deductionAmount, setDeductionAmount] = useState('0');
   const [inspectNotes, setInspectNotes] = useState('');
@@ -171,14 +217,18 @@ export default function ErpDashboardPage() {
   });
 
   const load = useCallback(async () => {
+    if (!getAccessToken()) {
+      setError(tr('يرجى تسجيل الدخول بحساب الموظف', 'Staff login required'));
+      return;
+    }
     try {
-      const [evs, apps, hallList, invs, items, clis, br] = await Promise.all([
-        apiFetch<StaffEventRow[]>('/api/v1/bookings/events'),
+      const [evs, apps, hallList, invs, , clis, br, govs] = await Promise.all([
+        apiFetch<CalendarEventRow[]>('/api/v1/bookings/events'),
         apiFetch<ApprovalRow[]>('/api/v1/approvals?status=PENDING'),
         apiFetch<HallInfo[]>('/api/v1/venue/halls'),
-        apiFetch<InvoiceRow[]>('/api/v1/finance/invoices').catch(() => [] as InvoiceRow[]),
+        apiFetch<ErpInvoiceDetail[]>('/api/v1/finance/invoices').catch(() => [] as ErpInvoiceDetail[]),
         apiFetch<InventoryRow[]>('/api/v1/venue/inventory').catch(() => [] as InventoryRow[]),
-        apiFetch<TenantClientRow[]>('/api/v1/tenant/clients').catch(() => [] as TenantClientRow[]),
+        apiFetch<RichClientRow[]>('/api/v1/tenant/clients').catch(() => [] as RichClientRow[]),
         apiFetch<{
           primary_color?: string;
           accent_color?: string;
@@ -186,13 +236,14 @@ export default function ErpDashboardPage() {
           logo_dark_url?: string | null;
           favicon_url?: string | null;
         }>('/api/v1/tenant/branding').catch(() => null),
+        apiFetch<GovernanceRequestRow[]>('/api/v1/governance/change-requests').catch(() => [] as GovernanceRequestRow[]),
       ]);
       setEvents(evs);
       setApprovals(apps);
       setHalls(hallList);
       setInvoices(invs);
-      setInventory(items);
       setClients(clis);
+      setGovernanceReqs(govs);
       if (br) {
         setBranding({
           primary_color: br.primary_color || '#D4AF37',
@@ -217,17 +268,17 @@ export default function ErpDashboardPage() {
   const filteredEvents = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return events.filter((ev) => {
-      if (hallFilter !== 'ALL' && ev.hall_id !== hallFilter) return false;
       if (!q) return true;
       return (
         ev.event_code.toLowerCase().includes(q) ||
+        (ev.title || '').toLowerCase().includes(q) ||
         ev.client_name.toLowerCase().includes(q) ||
         ev.hall_name.toLowerCase().includes(q) ||
         ev.hall_name_ar.toLowerCase().includes(q) ||
         ev.status.toLowerCase().includes(q)
       );
     });
-  }, [events, hallFilter, searchQuery]);
+  }, [events, searchQuery]);
 
   const selectedEvent =
     filteredEvents.find((e) => e.id === selectedEventId) ||
@@ -240,13 +291,14 @@ export default function ErpDashboardPage() {
   const eventApprovals = selectedEvent ? approvals.filter((a) => a.event_id === selectedEvent.id) : [];
   const selectedApproval = approvals.find((a) => a.id === selectedApprovalId) || approvals[0] || null;
 
-  const resolveApproval = async (id: string, decision: 'APPROVED' | 'REJECTED') => {
+  const resolveApproval = async (id: string, decision: 'APPROVED' | 'REJECTED' | 'RETURNED_FOR_AMENDMENT') => {
     try {
       const res = await apiFetch<{ status: string }>(`/api/v1/approvals/${id}/resolve`, {
         method: 'POST',
         body: {
           decision,
-          rejection_reason: decision === 'REJECTED' ? rejectionReason || 'Rejected by ERP manager' : null,
+          rejection_reason:
+            decision !== 'APPROVED' ? rejectionReason || `${decision} by ERP manager` : null,
         },
       });
       setRejectionReason('');
@@ -320,76 +372,73 @@ export default function ErpDashboardPage() {
     }
   };
 
-  const openManageClient = (c: TenantClientRow) => {
-    setManagedClient(c);
-    setClientForm({
-      full_name: c.full_name,
-      phone: c.phone,
-      is_active: c.is_active,
-      vip_tier: c.vip_tier || 'STANDARD',
-      client_category: c.client_category,
-      company_name: c.company_name || '',
-      tax_id: c.tax_id || '',
-      national_id_or_cr: c.national_id_or_cr || '',
-    });
-    setClientNewPassword('');
-  };
-
-  const saveManagedClient = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!managedClient) return;
+  const saveInlineEventTitle = async (eventId: string) => {
     try {
-      await apiFetch(`/api/v1/tenant/clients/${managedClient.id}`, {
+      await apiFetch(`/api/v1/bookings/events/${eventId}`, {
         method: 'PATCH',
-        body: {
-          full_name: clientForm.full_name.trim(),
-          phone: clientForm.phone.trim(),
-          is_active: clientForm.is_active,
-          vip_tier: clientForm.vip_tier,
-          client_category: clientForm.client_category,
-          company_name: clientForm.company_name.trim() || null,
-          tax_id: clientForm.tax_id.trim() || null,
-          national_id_or_cr: clientForm.national_id_or_cr.trim() || null,
-        },
+        body: { title: titleDraft.trim() || null, remarks: titleRemarks.trim() || null },
       });
-      setNotice(tr('تم تحديث بيانات العميل بنجاح', 'Client account updated'));
-      setManagedClient(null);
+      setEditingTitleEventId(null);
+      setTitleRemarks('');
+      setNotice(tr('تم تحديث عنوان الفعالية بنجاح', 'Event title updated'));
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update client');
+      setError(err instanceof Error ? err.message : 'Failed to update event title');
     }
   };
 
-  const resetClientPassword = async () => {
-    if (!managedClient || clientNewPassword.length < 8) return;
+  const resolveGovRequest = async (id: string, decision: 'APPROVED' | 'REJECTED' | 'RETURNED_FOR_AMENDMENT') => {
     try {
-      await apiFetch(`/api/v1/tenant/clients/${managedClient.id}/reset-password`, {
+      await apiFetch(`/api/v1/governance/change-requests/${id}/resolve`, {
         method: 'POST',
-        body: { new_password: clientNewPassword },
+        body: { decision, remarks: govRemarksMap[id]?.trim() || null },
       });
-      setClientNewPassword('');
-      setNotice(tr('تم تعيين كلمة المرور المؤقتة للعميل', 'Temporary client password set'));
+      setGovRemarksMap((prev) => ({ ...prev, [id]: '' }));
+      setNotice(tr(`تم تنفيذ قرار الحوكمة (${decision})`, `Governance request ${decision}`));
+      await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to reset password');
+      setError(err instanceof Error ? err.message : 'Failed to resolve governance request');
     }
   };
 
-  const filteredClients = useMemo(() => {
-    const q = clientSearch.trim().toLowerCase();
-    return clients.filter((c) => {
-      if (clientFilter === 'INDIVIDUAL_B2C' && c.client_category !== 'INDIVIDUAL_B2C') return false;
-      if (clientFilter === 'CORPORATE_B2B' && c.client_category !== 'CORPORATE_B2B') return false;
-      if (clientFilter === 'SUSPENDED' && c.is_active) return false;
-      if (!q) return true;
-      return (
-        c.full_name.toLowerCase().includes(q) ||
-        c.phone.toLowerCase().includes(q) ||
-        (c.email || '').toLowerCase().includes(q) ||
-        (c.company_name || '').toLowerCase().includes(q) ||
-        (c.tax_id || '').toLowerCase().includes(q)
-      );
-    });
-  }, [clientFilter, clientSearch, clients]);
+  const submitTenantGovRequest = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const proposed: Record<string, unknown> = {};
+    if (tenantGovForm.name.trim()) proposed.name = tenantGovForm.name.trim();
+    if (tenantGovForm.slug.trim()) proposed.slug = tenantGovForm.slug.trim();
+    if (tenantGovForm.custom_domain.trim()) proposed.custom_domain = tenantGovForm.custom_domain.trim();
+    if (tenantGovForm.currency.trim()) proposed.currency = tenantGovForm.currency.trim().toUpperCase();
+    if (tenantGovForm.tax_rate.trim()) proposed.tax_rate = Number(tenantGovForm.tax_rate);
+    if (Object.keys(proposed).length === 0) {
+      setError(tr('أدخل حقلاً واحداً على الأقل للتعديل', 'Provide at least one field to update'));
+      return;
+    }
+    try {
+      if (resubmitTenantId) {
+        await apiFetch(`/api/v1/governance/change-requests/${resubmitTenantId}/resubmit`, {
+          method: 'PATCH',
+          body: { proposed_values: proposed, remarks: resubmitRemarks.trim() || tenantGovForm.remarks.trim() || null },
+        });
+        setNotice(tr('تم تعديل وإعادة إرسال الطلب لمدير المنصة', 'Amended request resubmitted to Super Admin'));
+        setResubmitTenantId(null);
+        setResubmitRemarks('');
+      } else {
+        await apiFetch('/api/v1/governance/change-requests', {
+          method: 'POST',
+          body: {
+            target_entity_type: 'TENANT',
+            proposed_values: proposed,
+            remarks: tenantGovForm.remarks.trim() || null,
+          },
+        });
+        setNotice(tr('تم رفع طلب تعديل بيانات المنشأة لمدير المنصة', 'Tenant change request submitted for Super Admin approval'));
+      }
+      setTenantGovForm({ name: '', slug: '', custom_domain: '', currency: '', tax_rate: '', remarks: '' });
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to submit governance request');
+    }
+  };
 
   const totalRevenue = events.reduce((acc, e) => acc + (e.total_amount || 0), 0);
   const confirmedCount = events.filter((e) => e.status === 'CONFIRMED').length;
@@ -399,24 +448,11 @@ export default function ErpDashboardPage() {
     { id: 'CATALOG', labelAr: 'الأصناف والقاعات', labelEn: 'Items & Catalog' },
     { id: 'INVOICING', labelAr: 'الفوترة والدفعات', labelEn: 'Invoicing & Payments' },
     { id: 'OPERATIONS', labelAr: 'التشغيل و BEO', labelEn: 'Operations & BEO' },
+    { id: 'SECURITY', labelAr: 'الأمن والتأمين والإغلاق', labelEn: 'Security & Close' },
     { id: 'CLIENTS', labelAr: 'إدارة العملاء', labelEn: 'Clients' },
+    { id: 'GOVERNANCE', labelAr: 'الحوكمة والاعتمادات', labelEn: 'Governance' },
     { id: 'BRANDING', labelAr: 'الهوية البصرية', labelEn: 'Tenant Branding' },
   ];
-
-  // Calendar buckets for Month / Week views
-  const calendarDays = useMemo(() => {
-    const now = new Date();
-    const daysCount = calView === 'WEEK' ? 7 : 30;
-    return Array.from({ length: daysCount }, (_, i) => {
-      const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i);
-      const iso = d.toISOString().slice(0, 10);
-      return {
-        iso,
-        dayNum: d.getDate(),
-        events: filteredEvents.filter((ev) => ev.start_time.slice(0, 10) === iso),
-      };
-    });
-  }, [calView, filteredEvents]);
 
   const capacityPct =
     selectedEvent && selectedHall?.capacity_banquet
@@ -436,14 +472,23 @@ export default function ErpDashboardPage() {
           <SpotlightHeading as="h1" className="text-start text-2xl">
             {tr('لوحة تحكم إدارة القاعة (ERP)', 'Tenant Operations & Venue Control Panel')}
           </SpotlightHeading>
-          <div className="relative w-full sm:w-72">
-            <Search className="pointer-events-none absolute top-3 start-3 h-4 w-4 text-slate-400" />
-            <input
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder={tr('بحث برمز الفعالية أو العميل...', 'Search event code, client, hall...')}
-              className="min-h-[40px] w-full rounded-xl border border-slate-300 bg-white ps-9 pe-3 text-xs dark:border-slate-700 dark:bg-slate-900"
-            />
+          <div className="flex flex-wrap items-center gap-2">
+            <Link
+              href={tenantPath(locale, tenantSlug, '/erp/settings/users')}
+              className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-[var(--brand-primary,#D4AF37)]/60 bg-[var(--brand-primary,#D4AF37)]/10 px-3.5 text-xs font-bold text-[var(--brand-primary,#D4AF37)] hover:bg-[var(--brand-primary,#D4AF37)] hover:text-slate-950"
+            >
+              <Users className="h-4 w-4" />
+              <span>{tr('المستخدمون والصلاحيات', 'Users & RBAC')}</span>
+            </Link>
+            <div className="relative w-full sm:w-64">
+              <Search className="pointer-events-none absolute top-3 start-3 h-4 w-4 text-slate-400" />
+              <input
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder={tr('بحث برمز الفعالية أو العميل...', 'Search event code, client, hall...')}
+                className="min-h-[40px] w-full rounded-xl border border-slate-300 bg-white ps-9 pe-3 text-xs dark:border-slate-700 dark:bg-slate-900"
+              />
+            </div>
           </div>
         </div>
 
@@ -501,11 +546,10 @@ export default function ErpDashboardPage() {
                 role="tab"
                 aria-selected={active}
                 onClick={() => setActiveTab(tab.id)}
-                className={`-mb-px whitespace-nowrap border-b-2 px-1 py-3 text-xs transition ${
-                  active
-                    ? 'border-[var(--brand-primary)] font-semibold text-slate-900 dark:text-white'
-                    : 'border-transparent font-medium text-slate-500 hover:text-[var(--brand-primary,#D4AF37)] dark:text-slate-400'
-                }`}
+                className={`-mb-px whitespace-nowrap border-b-2 px-1 py-3 text-xs transition ${active
+                  ? 'border-[var(--brand-primary)] font-semibold text-slate-900 dark:text-white'
+                  : 'border-transparent font-medium text-slate-500 hover:text-[var(--brand-primary,#D4AF37)] dark:text-slate-400'
+                  }`}
               >
                 {isRtl ? tab.labelAr : tab.labelEn}
               </button>
@@ -517,187 +561,38 @@ export default function ErpDashboardPage() {
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
           <div className="space-y-6 lg:col-span-8">
             {activeTab === 'SCHEDULE' && (
-              <SpotlightCard className="space-y-4 text-start">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <SpotlightHeading as="h2" className="flex items-center gap-2 text-lg">
-                    <Layers className="h-5 w-5 text-[var(--brand-primary,#D4AF37)]" />
-                    <span>{tr('الجدول والتقويم التفاعلي', 'Interactive Hall Schedule & Calendar')}</span>
-                  </SpotlightHeading>
-                  <div className="flex gap-1 rounded-lg border border-slate-300 p-1 text-xs dark:border-slate-700">
-                    {(['MONTH', 'WEEK', 'AGENDA'] as CalView[]).map((v) => (
-                      <button
-                        key={v}
-                        type="button"
-                        onClick={() => setCalView(v)}
-                        className={`rounded px-2.5 py-1 font-semibold ${
-                          calView === v ? 'bg-[var(--brand-primary,#D4AF37)] text-slate-950' : ''
-                        }`}
-                      >
-                        {v}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Hall Filter Tabs */}
-                <div className="flex flex-wrap gap-2 text-xs">
-                  <button
-                    type="button"
-                    onClick={() => setHallFilter('ALL')}
-                    className={`rounded-full border px-3 py-1 font-semibold ${
-                      hallFilter === 'ALL'
-                        ? 'border-[var(--brand-primary)] bg-[var(--brand-primary)] text-slate-950'
-                        : 'border-slate-300 dark:border-slate-700'
-                    }`}
-                  >
-                    {tr('كل القاعات', 'All Halls')}
-                  </button>
-                  {halls.map((h) => (
-                    <button
-                      key={h.id}
-                      type="button"
-                      onClick={() => setHallFilter(h.id)}
-                      className={`rounded-full border px-3 py-1 font-semibold ${
-                        hallFilter === h.id
-                          ? 'border-[var(--brand-primary)] bg-[var(--brand-primary)] text-slate-950'
-                          : 'border-slate-300 dark:border-slate-700'
-                      }`}
-                    >
-                      {isRtl ? h.name_ar : h.name}
-                    </button>
-                  ))}
-                </div>
-
-                {calView === 'AGENDA' ? (
-                  <div className="space-y-2">
-                    {filteredEvents.length === 0 ? (
-                      <p className="text-xs text-slate-500">{tr('لا توجد حجوزات مطابقة.', 'No matching events.')}</p>
-                    ) : (
-                      filteredEvents.map((ev) => (
-                        <button
-                          key={ev.id}
-                          type="button"
-                          onClick={() => setSelectedEventId(ev.id)}
-                          className={`flex w-full flex-wrap items-center justify-between gap-2 rounded-xl border p-3 text-start text-xs transition ${
-                            selectedEvent?.id === ev.id
-                              ? 'border-[var(--brand-primary,#D4AF37)] ring-1 ring-[var(--brand-primary,#D4AF37)]'
-                              : 'border-slate-200 dark:border-slate-800'
-                          }`}
-                        >
-                          <div>
-                            <div className="flex items-center gap-2 font-bold">
-                              <span className="font-mono text-amber-500">{ev.event_code}</span>
-                              <span>{ev.client_name}</span>
-                            </div>
-                            <div className="text-slate-500">
-                              {isRtl ? ev.hall_name_ar : ev.hall_name} · {ev.guest_count} {tr('ضيف', 'guests')}
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <span dir="ltr" className="font-mono text-[11px] text-slate-500">
-                              {ev.start_time.slice(0, 16).replace('T', ' ')}
-                            </span>
-                            <span className={`rounded border px-2 py-0.5 font-bold ${STATUS_STYLE[ev.status] || STATUS_STYLE.CONFIRMED}`}>
-                              {ev.status}
-                            </span>
-                          </div>
-                        </button>
-                      ))
-                    )}
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-5 lg:grid-cols-7">
-                    {calendarDays.map((d) => (
-                      <div key={d.iso} className="min-h-[84px] rounded-lg border border-slate-200 p-2 text-xs dark:border-slate-800">
-                        <div className="font-mono text-[11px] font-bold text-slate-500">{d.iso.slice(5)}</div>
-                        <div className="mt-1 space-y-1">
-                          {d.events.map((ev) => (
-                            <button
-                              key={ev.id}
-                              type="button"
-                              onClick={() => setSelectedEventId(ev.id)}
-                              className={`block w-full truncate rounded border px-1.5 py-0.5 text-start text-[10px] font-bold ${
-                                STATUS_STYLE[ev.status] || STATUS_STYLE.CONFIRMED
-                              }`}
-                            >
-                              {ev.event_code}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </SpotlightCard>
+              <OutlookHallCalendar
+                locale={locale}
+                tenantSlug={tenantSlug}
+                halls={halls}
+                events={filteredEvents}
+                selectedEventId={selectedEvent?.id || ''}
+                onSelectEvent={(id) => setSelectedEventId(id)}
+                onJumpToSecurity={(id, subtab) => {
+                  setSelectedEventId(id);
+                  setSecurityInitialSubTab(subtab || 'READINESS');
+                  setActiveTab('SECURITY');
+                }}
+                onOpenInspection={(ev) => {
+                  setSelectedEventId(ev.id);
+                  setInspectEvent(ev);
+                  setInspectStatus('PASSED');
+                  setDeductionAmount('0');
+                }}
+              />
             )}
 
             {activeTab === 'CATALOG' && (
-              <SpotlightCard className="space-y-4 text-start">
-                <div className="flex items-center justify-between">
-                  <SpotlightHeading as="h2" className="text-lg">
-                    {tr('الأصناف والمخزون والقاعات', 'Halls & Equipment Add-On Catalog')}
-                  </SpotlightHeading>
-                  <Link href={tenantPath(locale, tenantSlug, '/erp/settings/lookups')} className="text-xs font-bold text-[var(--brand-primary,#D4AF37)] underline">
-                    {tr('إدارة القوائم', 'System Lookups')}
-                  </Link>
-                </div>
-                <ResponsiveDataList
-                  data={inventory}
-                  locale={locale}
-                  mobileCardHeader={(r) => r.name}
-                  columns={[
-                    { key: 'name', headerAr: 'الصنف', headerEn: 'Item', render: (r) => r.name },
-                    { key: 'cat', headerAr: 'الفئة', headerEn: 'Category', render: (r) => r.category },
-                    { key: 'stock', headerAr: 'المخزون', headerEn: 'Stock', render: (r) => r.total_stock },
-                    { key: 'price', headerAr: 'سعر الإضافة', headerEn: 'Addon Price', render: (r) => Number(r.unit_addon_price).toLocaleString() },
-                  ]}
-                />
-              </SpotlightCard>
+              <CatalogControlPlane locale={locale} tenantSlug={tenantSlug} onCatalogChanged={load} />
             )}
 
             {activeTab === 'INVOICING' && (
-              <SpotlightCard className="space-y-4 text-start">
-                <div className="flex items-center justify-between">
-                  <SpotlightHeading as="h2" className="text-lg">
-                    {tr('الفوترة واعتماد الدفعات', 'Invoicing & Payment Verification')}
-                  </SpotlightHeading>
-                  <Link href={tenantPath(locale, tenantSlug, '/erp/finance/ledger')} className="text-xs font-bold text-[var(--brand-primary,#D4AF37)] underline">
-                    {tr('دفتر الأستاذ وميزان المراجعة', 'General Ledger')}
-                  </Link>
-                </div>
-                <div className="space-y-3">
-                  {invoices.map((inv) => (
-                    <div key={inv.id} className="rounded-xl border border-slate-200 p-3 text-xs dark:border-slate-800">
-                      <div className="flex flex-wrap items-center justify-between gap-2 font-bold">
-                        <span className="font-mono text-amber-500">
-                          {inv.invoice_number} ({inv.event_code})
-                        </span>
-                        <span>
-                          {inv.paid_amount.toLocaleString()} / {inv.total_amount.toLocaleString()} · {inv.status}
-                        </span>
-                      </div>
-                      <div className="mt-2 space-y-1.5">
-                        {inv.milestones.map((m) => (
-                          <div key={m.id} className="flex flex-wrap items-center justify-between gap-2 rounded bg-slate-50 p-2 dark:bg-slate-950">
-                            <span>
-                              {m.title} ({Number(m.amount_due).toLocaleString()} · {m.status})
-                            </span>
-                            {m.status !== 'PAID' && (
-                              <button
-                                type="button"
-                                onClick={() => verifyMilestone(m.id, m.payment_method || 'KURAIMI_BANK')}
-                                className="rounded bg-emerald-600 px-2.5 py-1 text-[11px] font-bold text-white"
-                              >
-                                {tr('اعتماد الدفعة', 'Verify')}
-                              </button>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </SpotlightCard>
+              <InvoicingAndContractsPanel
+                locale={locale}
+                tenantSlug={tenantSlug}
+                invoices={invoices}
+                onRefresh={load}
+              />
             )}
 
             {activeTab === 'OPERATIONS' && (
@@ -722,11 +617,10 @@ export default function ErpDashboardPage() {
                           key={ap.id}
                           type="button"
                           onClick={() => setSelectedApprovalId(ap.id)}
-                          className={`w-full rounded-xl border p-3 text-start text-xs ${
-                            selectedApproval?.id === ap.id
-                              ? 'border-[var(--brand-primary,#D4AF37)] bg-[var(--brand-primary,#D4AF37)]/10'
-                              : 'border-slate-200 dark:border-slate-800'
-                          }`}
+                          className={`w-full rounded-xl border p-3 text-start text-xs ${selectedApproval?.id === ap.id
+                            ? 'border-[var(--brand-primary,#D4AF37)] bg-[var(--brand-primary,#D4AF37)]/10'
+                            : 'border-slate-200 dark:border-slate-800'
+                            }`}
                         >
                           <div className="flex justify-between font-bold">
                             <span className="font-mono text-amber-500">{ap.event_code}</span>
@@ -759,6 +653,13 @@ export default function ErpDashboardPage() {
                           </button>
                           <button
                             type="button"
+                            onClick={() => resolveApproval(selectedApproval.id, 'RETURNED_FOR_AMENDMENT')}
+                            className="min-h-[38px] rounded-lg bg-amber-500 px-3 font-bold text-slate-950"
+                          >
+                            {tr('إعادة للتعديل', 'Return')}
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => resolveApproval(selectedApproval.id, 'REJECTED')}
                             className="min-h-[38px] rounded-lg bg-rose-600 px-3 font-bold text-white"
                           >
@@ -772,128 +673,217 @@ export default function ErpDashboardPage() {
               </SpotlightCard>
             )}
 
+            {activeTab === 'SECURITY' && (
+              <SecurityAndCloseControlPlane
+                locale={locale}
+                tenantSlug={tenantSlug}
+                events={events}
+                selectedEventId={selectedEvent?.id || ''}
+                onSelectEvent={(id) => setSelectedEventId(id)}
+                initialSubTab={securityInitialSubTab}
+                onRefreshDashboard={load}
+              />
+            )}
+
             {activeTab === 'CLIENTS' && (
-              <SpotlightCard className="space-y-4 text-start">
-                <div className="flex flex-wrap items-center justify-between gap-3">
+              <ClientAccountsControlPanel locale={locale} clients={clients} onRefresh={load} />
+            )}
+
+            {activeTab === 'GOVERNANCE' && (
+              <div className="space-y-4">
+                <SpotlightCard className="space-y-4 text-start">
                   <SpotlightHeading as="h2" className="flex items-center gap-2 text-lg">
-                    <Users className="h-5 w-5 text-[var(--brand-primary,#D4AF37)]" />
-                    <span>{tr('لوحة إدارة حسابات العملاء', 'Tenant Client Accounts Control Panel')}</span>
+                    <ShieldCheck className="h-5 w-5 text-[var(--brand-primary,#D4AF37)]" />
+                    <span>{tr('اعتمادات تعديل بيانات العملاء والفعاليات', 'Tenant-Admin Approval Queue')}</span>
                   </SpotlightHeading>
-                  <input
-                    value={clientSearch}
-                    onChange={(e) => setClientSearch(e.target.value)}
-                    placeholder={tr('بحث بالاسم، الجوال، الشركة...', 'Search name, phone, company, tax ID...')}
-                    className="min-h-[38px] w-full rounded-lg border border-slate-300 bg-white px-3 text-xs dark:border-slate-700 dark:bg-slate-950 sm:w-64"
-                  />
-                </div>
-
-                <div className="flex flex-wrap gap-2 text-xs">
-                  {(
-                    [
-                      { key: 'ALL', ar: 'الكل', en: 'All' },
-                      { key: 'INDIVIDUAL_B2C', ar: 'أفراد B2C', en: 'B2C' },
-                      { key: 'CORPORATE_B2B', ar: 'شركات B2B', en: 'B2B' },
-                      { key: 'SUSPENDED', ar: 'موقوف', en: 'Suspended' },
-                    ] as const
-                  ).map((f) => (
-                    <button
-                      key={f.key}
-                      type="button"
-                      onClick={() => setClientFilter(f.key)}
-                      className={`rounded-full border px-3 py-1 font-semibold ${
-                        clientFilter === f.key
-                          ? 'border-[var(--brand-primary)] bg-[var(--brand-primary)] text-slate-950'
-                          : 'border-slate-300 dark:border-slate-700'
-                      }`}
-                    >
-                      {isRtl ? f.ar : f.en}
-                    </button>
-                  ))}
-                </div>
-
-                <ResponsiveDataList
-                  data={filteredClients}
-                  locale={locale}
-                  mobileCardHeader={(c) => `${c.full_name} (${c.vip_tier})`}
-                  columns={[
-                    {
-                      key: 'name',
-                      headerAr: 'العميل',
-                      headerEn: 'Client',
-                      render: (c) => (
-                        <div className="text-xs">
-                          <div className="font-bold">{c.full_name}</div>
-                          <div dir="ltr" className="text-[11px] text-slate-500">
-                            {c.phone} {c.email ? `· ${c.email}` : ''}
+                  {governanceReqs.filter((g) => g.scope === 'TENANT_ADMIN').length === 0 ? (
+                    <p className="text-xs text-slate-500">
+                      {tr('لا توجد طلبات حوكمة على مستوى المنشأة حالياً.', 'No tenant-level governance change requests yet.')}
+                    </p>
+                  ) : (
+                    <div className="space-y-3">
+                      {governanceReqs
+                        .filter((g) => g.scope === 'TENANT_ADMIN')
+                        .map((g) => (
+                          <div key={g.id} className="space-y-2 rounded-xl border border-slate-200 p-3 text-xs dark:border-slate-800">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="font-bold">{g.request_title}</div>
+                              <span className="rounded bg-amber-500/15 px-2 py-0.5 font-mono text-[10px] font-bold text-amber-500">
+                                {g.status}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              {tr('مقدم الطلب:', 'Requester:')} {g.requester_name} · {g.target_entity_type}
+                              {g.requester_remarks ? ` — "${g.requester_remarks}"` : ''}
+                            </div>
+                            <div className="grid gap-2 rounded-lg bg-slate-100 p-2 font-mono text-[11px] dark:bg-slate-900 sm:grid-cols-2">
+                              <div>
+                                <div className="text-[10px] font-bold text-slate-500">{tr('الحالي', 'Current')}</div>
+                                <pre className="whitespace-pre-wrap">{JSON.stringify(g.current_values, null, 1)}</pre>
+                              </div>
+                              <div>
+                                <div className="text-[10px] font-bold text-emerald-500">{tr('المقترح', 'Proposed')}</div>
+                                <pre className="whitespace-pre-wrap">{JSON.stringify(g.proposed_values, null, 1)}</pre>
+                              </div>
+                            </div>
+                            {(g.status === 'PENDING' || g.status === 'RETURNED_FOR_AMENDMENT') && (
+                              <div className="flex flex-wrap items-center gap-2 pt-1">
+                                <input
+                                  value={govRemarksMap[g.id] || ''}
+                                  onChange={(e) => setGovRemarksMap((prev) => ({ ...prev, [g.id]: e.target.value }))}
+                                  placeholder={tr('ملاحظات الاعتماد أو التعديل...', 'Approval / amendment remarks...')}
+                                  className="min-h-[34px] flex-1 rounded-lg border border-slate-300 bg-white px-2.5 text-xs dark:border-slate-700 dark:bg-slate-950"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => resolveGovRequest(g.id, 'APPROVED')}
+                                  className="rounded-lg bg-emerald-600 px-3 py-1.5 font-bold text-white"
+                                >
+                                  {tr('اعتماد', 'Approve')}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => resolveGovRequest(g.id, 'RETURNED_FOR_AMENDMENT')}
+                                  className="rounded-lg bg-amber-500 px-3 py-1.5 font-bold text-slate-950"
+                                >
+                                  {tr('إعادة للتعديل', 'Return')}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => resolveGovRequest(g.id, 'REJECTED')}
+                                  className="rounded-lg bg-rose-600 px-3 py-1.5 font-bold text-white"
+                                >
+                                  {tr('رفض', 'Reject')}
+                                </button>
+                              </div>
+                            )}
                           </div>
-                        </div>
-                      ),
-                    },
-                    {
-                      key: 'cat',
-                      headerAr: 'الفئة والشركة',
-                      headerEn: 'Category / Company',
-                      render: (c) => (
-                        <div className="text-xs">
-                          <span className="font-mono font-semibold">{c.client_category}</span>
-                          {c.company_name && <div className="text-[11px] text-slate-500">{c.company_name} ({c.tax_id || '-'})</div>}
-                        </div>
-                      ),
-                    },
-                    {
-                      key: 'vip',
-                      headerAr: 'VIP',
-                      headerEn: 'VIP Tier',
-                      render: (c) => (
-                        <span className="rounded-full bg-[var(--brand-primary,#D4AF37)]/15 px-2 py-0.5 font-mono text-[11px] font-bold text-amber-500">
-                          {c.vip_tier}
-                        </span>
-                      ),
-                    },
-                    {
-                      key: 'stats',
-                      headerAr: 'الحجوزات والرصيد',
-                      headerEn: 'Events & Balance',
-                      render: (c) => (
-                        <div className="text-xs">
-                          <div>{c.events_count} {tr('فعالية', 'events')}</div>
-                          <div dir="ltr" className="font-mono text-[11px] text-amber-500">
-                            {c.outstanding_balance.toLocaleString()}
-                          </div>
-                        </div>
-                      ),
-                    },
-                    {
-                      key: 'status',
-                      headerAr: 'الحالة',
-                      headerEn: 'Status',
-                      render: (c) => (
-                        <span
-                          className={`rounded-full px-2 py-0.5 text-[11px] font-bold ${
-                            c.is_active ? 'bg-emerald-500/20 text-emerald-500' : 'bg-rose-500/20 text-rose-500'
-                          }`}
-                        >
-                          {c.is_active ? tr('نشط', 'Active') : tr('موقوف', 'Suspended')}
-                        </span>
-                      ),
-                    },
-                    {
-                      key: 'manage',
-                      headerAr: 'إدارة',
-                      headerEn: 'Manage',
-                      render: (c) => (
+                        ))}
+                    </div>
+                  )}
+                </SpotlightCard>
+
+                <SpotlightCard className="space-y-4 text-start">
+                  <SpotlightHeading as="h2" className="flex items-center gap-2 text-lg">
+                    <Send className="h-5 w-5 text-[var(--brand-primary,#D4AF37)]" />
+                    <span>
+                      {resubmitTenantId
+                        ? tr('تعديل وإعادة إرسال طلب هوية المنشأة', 'Amend & Resubmit Tenant Change Request')
+                        : tr('طلب تعديل بيانات المنشأة (يتطلب اعتماد مدير المنصة)', 'Request Tenant Identity Change (Super-Admin Approval)')}
+                    </span>
+                  </SpotlightHeading>
+                  <form onSubmit={submitTenantGovRequest} className="grid gap-3 text-xs sm:grid-cols-2">
+                    <input
+                      value={tenantGovForm.name}
+                      onChange={(e) => setTenantGovForm({ ...tenantGovForm, name: e.target.value })}
+                      placeholder={tr('اسم المنشأة الجديد (اختياري)', 'New Venue Name (optional)')}
+                      className="min-h-[38px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                    />
+                    <input
+                      dir="ltr"
+                      value={tenantGovForm.slug}
+                      onChange={(e) => setTenantGovForm({ ...tenantGovForm, slug: e.target.value })}
+                      placeholder={tr('المعرف الجديد (slug)', 'New Slug (e.g. qasralomara)')}
+                      className="min-h-[38px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                    />
+                    <input
+                      dir="ltr"
+                      value={tenantGovForm.custom_domain}
+                      onChange={(e) => setTenantGovForm({ ...tenantGovForm, custom_domain: e.target.value })}
+                      placeholder={tr('النطاق المخصص (CNAME)', 'Custom Domain (optional)')}
+                      className="min-h-[38px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                    />
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        dir="ltr"
+                        value={tenantGovForm.currency}
+                        onChange={(e) => setTenantGovForm({ ...tenantGovForm, currency: e.target.value })}
+                        placeholder={tr('العملة (USD)', 'Currency')}
+                        className="min-h-[38px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                      />
+                      <input
+                        dir="ltr"
+                        type="number"
+                        step="0.01"
+                        value={tenantGovForm.tax_rate}
+                        onChange={(e) => setTenantGovForm({ ...tenantGovForm, tax_rate: e.target.value })}
+                        placeholder={tr('نسبة الضريبة %', 'Tax Rate %')}
+                        className="min-h-[38px] rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+                      />
+                    </div>
+                    <input
+                      value={resubmitTenantId ? resubmitRemarks : tenantGovForm.remarks}
+                      onChange={(e) =>
+                        resubmitTenantId
+                          ? setResubmitRemarks(e.target.value)
+                          : setTenantGovForm({ ...tenantGovForm, remarks: e.target.value })
+                      }
+                      placeholder={tr('سبب التعديل / ملاحظات لمدير المنصة', 'Reason / remarks for Super Admin')}
+                      className="min-h-[38px] rounded-lg border border-slate-300 bg-white px-3 sm:col-span-2 dark:border-slate-700 dark:bg-slate-950"
+                    />
+                    <div className="flex gap-2 sm:col-span-2">
+                      <button type="submit" className="min-h-[38px] rounded-lg bg-[var(--brand-primary,#D4AF37)] px-4 font-bold text-slate-950">
+                        {resubmitTenantId ? tr('إعادة إرسال للمنصة', 'Resubmit Request') : tr('رفع الطلب لمدير المنصة', 'Submit to Super Admin')}
+                      </button>
+                      {resubmitTenantId && (
                         <button
                           type="button"
-                          onClick={() => openManageClient(c)}
-                          className="rounded-lg border border-slate-300 px-3 py-1 text-xs font-semibold hover:border-[var(--brand-primary,#D4AF37)] dark:border-slate-700"
+                          onClick={() => {
+                            setResubmitTenantId(null);
+                            setTenantGovForm({ name: '', slug: '', custom_domain: '', currency: '', tax_rate: '', remarks: '' });
+                          }}
+                          className="min-h-[38px] rounded-lg border border-slate-300 px-3 dark:border-slate-700"
                         >
-                          {tr('إدارة', 'Manage')}
+                          {tr('إلغاء', 'Cancel')}
                         </button>
-                      ),
-                    },
-                  ]}
-                />
-              </SpotlightCard>
+                      )}
+                    </div>
+                  </form>
+
+                  {governanceReqs.filter((g) => g.scope === 'SUPER_ADMIN').length > 0 && (
+                    <div className="space-y-2 border-t border-slate-200 pt-3 text-xs dark:border-slate-800">
+                      {governanceReqs
+                        .filter((g) => g.scope === 'SUPER_ADMIN')
+                        .map((g) => (
+                          <div key={g.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 p-2.5 dark:border-slate-800">
+                            <div>
+                              <div className="font-bold">{g.request_title}</div>
+                              <div className="font-mono text-[11px] text-slate-500">{JSON.stringify(g.proposed_values)}</div>
+                              {g.reviewer_remarks && (
+                                <div className="text-[11px] text-amber-500">
+                                  {tr('ملاحظات المنصة:', 'Platform Remarks:')} {g.reviewer_remarks}
+                                </div>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className="rounded bg-slate-800 px-2 py-0.5 font-mono text-[10px] font-bold text-white">{g.status}</span>
+                              {g.status === 'RETURNED_FOR_AMENDMENT' && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setResubmitTenantId(g.id);
+                                    const pv = g.proposed_values || {};
+                                    setTenantGovForm({
+                                      name: String(pv.name || ''),
+                                      slug: String(pv.slug || ''),
+                                      custom_domain: String(pv.custom_domain || ''),
+                                      currency: String(pv.currency || ''),
+                                      tax_rate: pv.tax_rate !== undefined ? String(pv.tax_rate) : '',
+                                      remarks: g.requester_remarks || '',
+                                    });
+                                  }}
+                                  className="rounded border border-amber-500 px-2.5 py-1 text-[11px] font-bold text-amber-500"
+                                >
+                                  {tr('تعديل وإعادة إرسال', 'Amend & Resubmit')}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                    </div>
+                  )}
+                </SpotlightCard>
+              </div>
             )}
 
             {activeTab === 'BRANDING' && (
@@ -964,7 +954,60 @@ export default function ErpDashboardPage() {
                   </div>
 
                   <div className="space-y-1">
-                    <div className="font-bold text-slate-900 dark:text-white">{selectedEvent.client_name}</div>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="font-bold text-slate-900 dark:text-white">
+                        {selectedEvent.title || selectedEvent.client_name}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingTitleEventId(selectedEvent.id);
+                          setTitleDraft(selectedEvent.title || '');
+                          setTitleRemarks('');
+                        }}
+                        className="inline-flex items-center gap-1 rounded border border-slate-300 px-2 py-0.5 text-[10px] font-semibold hover:border-[var(--brand-primary,#D4AF37)] dark:border-slate-700"
+                      >
+                        <Edit3 className="h-3 w-3" />
+                        <span>{tr('تعديل العنوان', 'Edit Title')}</span>
+                      </button>
+                    </div>
+                    {editingTitleEventId === selectedEvent.id && (
+                      <div className="space-y-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-2">
+                        <input
+                          value={titleDraft}
+                          onChange={(e) => setTitleDraft(e.target.value)}
+                          placeholder={tr('عنوان الفعالية المخصص...', 'Custom event title...')}
+                          className="min-h-[34px] w-full rounded border border-slate-300 bg-white px-2 text-xs dark:border-slate-700 dark:bg-slate-950"
+                        />
+                        <input
+                          value={titleRemarks}
+                          onChange={(e) => setTitleRemarks(e.target.value)}
+                          placeholder={tr('ملاحظة سجل التدقيق (اختياري)', 'Audit remarks (optional)')}
+                          className="min-h-[34px] w-full rounded border border-slate-300 bg-white px-2 text-xs dark:border-slate-700 dark:bg-slate-950"
+                        />
+                        <div className="flex gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => saveInlineEventTitle(selectedEvent.id)}
+                            className="rounded bg-[var(--brand-primary,#D4AF37)] px-2.5 py-1 text-[11px] font-bold text-slate-950"
+                          >
+                            {tr('حفظ', 'Save')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditingTitleEventId(null)}
+                            className="rounded border border-slate-300 px-2.5 py-1 text-[11px] dark:border-slate-700"
+                          >
+                            {tr('إلغاء', 'Cancel')}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {selectedEvent.title && (
+                      <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                        {selectedEvent.client_name}
+                      </div>
+                    )}
                     <div className="text-slate-500">{isRtl ? selectedEvent.hall_name_ar : selectedEvent.hall_name}</div>
                     <div dir="ltr" className="flex items-center gap-1.5 font-mono text-[11px] text-slate-500">
                       <Clock className="h-3.5 w-3.5" />
@@ -1043,23 +1086,30 @@ export default function ErpDashboardPage() {
                     <button
                       type="button"
                       onClick={() => {
-                        setInspectEvent(selectedEvent);
-                        setInspectStatus('PASSED');
-                        setDeductionAmount('0');
+                        setSecurityInitialSubTab('DEPOSIT_CLOSE');
+                        setActiveTab('SECURITY');
                       }}
                       className="inline-flex min-h-[38px] flex-1 items-center justify-center gap-1.5 rounded-lg bg-[var(--brand-primary,#D4AF37)] px-3 font-bold text-slate-950"
                     >
                       <ShieldCheck className="h-4 w-4" />
-                      <span>{tr('فحص ما بعد المناسبة', 'Damage Inspection')}</span>
+                      <span>{tr('الأمن والتأمين والإغلاق', 'Security & Close Op')}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setInspectEvent(selectedEvent);
+                        setInspectStatus('PASSED');
+                        setDeductionAmount('0');
+                      }}
+                      className="inline-flex min-h-[38px] items-center rounded-lg border border-amber-500/40 px-3 font-bold text-amber-600 dark:text-amber-300"
+                    >
+                      {tr('فحص سريع', 'Quick Inspect')}
                     </button>
                     <Link
                       href={
                         process.env.NEXT_PUBLIC_BUILD_TARGET === 'NATIVE'
-                          ? `/${locale}/erp/finance/events/_/pnl/?id=${encodeURIComponent(selectedEvent.id)}`
-                          : dynamicHref(locale, '/erp/finance/events', selectedEvent.id).replace(
-                              selectedEvent.id,
-                              `${selectedEvent.id}/pnl`
-                            )
+                          ? tenantPath(locale, tenantSlug, `/erp/finance/events/_/pnl/?id=${encodeURIComponent(selectedEvent.id)}`)
+                          : tenantPath(locale, tenantSlug, `/erp/finance/events/${selectedEvent.id}/pnl`)
                       }
                       className="inline-flex min-h-[38px] items-center rounded-lg border border-slate-300 px-3 font-bold dark:border-slate-700"
                     >
@@ -1073,98 +1123,6 @@ export default function ErpDashboardPage() {
         </div>
       </main>
 
-      {/* Manage Client Modal */}
-      {managedClient && (
-        <div
-          dir={isRtl ? 'rtl' : 'ltr'}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-sm"
-        >
-          <SpotlightCard className="w-full max-w-lg space-y-4 text-start">
-            <div className="flex items-center justify-between gap-2">
-              <SpotlightHeading as="h3" className="text-lg">
-                {tr(`إدارة حساب العميل (${managedClient.full_name})`, `Manage Client (${managedClient.full_name})`)}
-              </SpotlightHeading>
-              <button type="button" onClick={() => setManagedClient(null)} aria-label="Close modal" className="rounded-lg p-1 text-slate-400 hover:text-white">
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-
-            <form onSubmit={saveManagedClient} className="space-y-3 text-xs">
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div>
-                  <label className="mb-1 block font-semibold">{tr('الاسم الكامل', 'Full Name')}</label>
-                  <input required value={clientForm.full_name} onChange={(e) => setClientForm({ ...clientForm, full_name: e.target.value })} className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950" />
-                </div>
-                <div>
-                  <label className="mb-1 block font-semibold">{tr('الجوال', 'Phone')}</label>
-                  <input dir="ltr" required value={clientForm.phone} onChange={(e) => setClientForm({ ...clientForm, phone: e.target.value })} className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950" />
-                </div>
-                <div>
-                  <label className="mb-1 block font-semibold">{tr('مستوى VIP', 'VIP Tier')}</label>
-                  <select value={clientForm.vip_tier} onChange={(e) => setClientForm({ ...clientForm, vip_tier: e.target.value })} className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950">
-                    <option value="STANDARD">STANDARD</option>
-                    <option value="GOLD">GOLD</option>
-                    <option value="VIP">VIP</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="mb-1 block font-semibold">{tr('فئة العميل', 'Client Category')}</label>
-                  <select
-                    value={clientForm.client_category}
-                    onChange={(e) => setClientForm({ ...clientForm, client_category: e.target.value as 'INDIVIDUAL_B2C' | 'CORPORATE_B2B' })}
-                    className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
-                  >
-                    <option value="INDIVIDUAL_B2C">INDIVIDUAL_B2C</option>
-                    <option value="CORPORATE_B2B">CORPORATE_B2B</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="mb-1 block font-semibold">{tr('اسم الشركة', 'Company Name')}</label>
-                  <input value={clientForm.company_name} onChange={(e) => setClientForm({ ...clientForm, company_name: e.target.value })} className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950" />
-                </div>
-                <div>
-                  <label className="mb-1 block font-semibold">{tr('الرقم الضريبي / الهوية', 'Tax ID / National ID')}</label>
-                  <input dir="ltr" value={clientForm.tax_id} onChange={(e) => setClientForm({ ...clientForm, tax_id: e.target.value })} className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950" />
-                </div>
-              </div>
-
-              <label className="flex items-center gap-2 rounded-lg border border-slate-200 p-2.5 font-semibold dark:border-slate-800">
-                <input type="checkbox" checked={clientForm.is_active} onChange={(e) => setClientForm({ ...clientForm, is_active: e.target.checked })} />
-                <span>{tr('تفعيل دخول العميل (نشط)', 'Account Active (Allow Portal Login)')}</span>
-              </label>
-
-              <div className="flex justify-end gap-2">
-                <button type="submit" className="min-h-[38px] rounded-lg bg-[var(--brand-primary,#D4AF37)] px-4 font-bold text-slate-950">
-                  {tr('حفظ التعديلات', 'Save Client')}
-                </button>
-              </div>
-            </form>
-
-            <div className="space-y-2 border-t border-slate-200 pt-3 text-xs dark:border-slate-800">
-              <div className="font-bold">{tr('تعيين كلمة مرور مؤقتة', 'Reset Client Password')}</div>
-              <div className="flex gap-2">
-                <input
-                  type="password"
-                  minLength={8}
-                  value={clientNewPassword}
-                  onChange={(e) => setClientNewPassword(e.target.value)}
-                  placeholder={tr('كلمة مرور جديدة (8+ أحرف)', 'New temp password (8+ chars)')}
-                  className="min-h-[38px] flex-1 rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
-                />
-                <button
-                  type="button"
-                  disabled={clientNewPassword.length < 8}
-                  onClick={resetClientPassword}
-                  className="min-h-[38px] rounded-lg border border-amber-500/50 bg-amber-500/10 px-3 font-bold text-amber-500 disabled:opacity-40"
-                >
-                  {tr('تعيين', 'Reset Password')}
-                </button>
-              </div>
-            </div>
-          </SpotlightCard>
-        </div>
-      )}
-
       {/* Post-Event Damage Inspection Modal */}
       {inspectEvent && (
         <div
@@ -1176,9 +1134,12 @@ export default function ErpDashboardPage() {
               <SpotlightHeading as="h3" className="text-start text-lg">
                 {tr(`فحص القاعة وتسوية التأمين (${inspectEvent.event_code})`, `Post-Event Damage Inspection (${inspectEvent.event_code})`)}
               </SpotlightHeading>
-              <button type="button" onClick={() => setInspectEvent(null)} aria-label="Close modal" className="rounded-lg p-1 text-slate-400 hover:text-white">
-                <X className="h-5 w-5" />
-              </button>
+              <div className="flex items-center gap-2">
+                <BackButton locale={locale} compact onClick={() => setInspectEvent(null)} />
+                <button type="button" onClick={() => setInspectEvent(null)} aria-label="Close modal" className="rounded-lg p-1 text-slate-400 hover:text-slate-900 dark:hover:text-white">
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
             </div>
 
             <form onSubmit={submitInspection} className="space-y-4 text-xs">

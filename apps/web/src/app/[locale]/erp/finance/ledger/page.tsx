@@ -22,7 +22,7 @@ import { AppHeader } from '@/components/layout/AppHeader';
 import { MobileBottomNav } from '@/components/layout/MobileBottomNav';
 import { ResponsiveDataList } from '@/components/ui/ResponsiveDataList';
 import { SpotlightCard, SpotlightHeading } from '@/components/ui/spotlight-elements';
-import { apiFetch, downloadAuthorizedFile } from '@/lib/api';
+import { apiFetch, downloadAuthorizedFile, getAccessToken } from '@/lib/api';
 
 type LedgerTab = 'LEDGER_TB' | 'STATEMENTS' | 'FISCAL_PERIODS' | 'COA';
 
@@ -56,6 +56,15 @@ interface JournalEntryRow {
   reversed_entry_id?: string | null;
   total_debit: number;
   total_credit: number;
+  lines?: {
+    account_id: string;
+    account_code: string;
+    account_name_ar: string;
+    account_name_en: string;
+    debit: number;
+    credit: number;
+    memo?: string | null;
+  }[];
 }
 
 interface InvoiceMilestoneRow {
@@ -68,6 +77,7 @@ interface InvoiceMilestoneRow {
   receipt_url: string | null;
   is_security_deposit?: boolean;
   status: string;
+  reviewer_remarks?: string | null;
 }
 
 interface InvoiceRow {
@@ -158,6 +168,13 @@ export default function GeneralLedgerPage() {
   const [verifyMethods, setVerifyMethods] = useState<Record<string, string>>({});
   const [verifyDeposits, setVerifyDeposits] = useState<Record<string, boolean>>({});
   const [verifyRefs, setVerifyRefs] = useState<Record<string, string>>({});
+  const [returnTargetId, setReturnTargetId] = useState<string | null>(null);
+  const [returnRemarks, setReturnRemarks] = useState('');
+  const [expandedJeId, setExpandedJeId] = useState<string | null>(null);
+
+  // Edit Account Modal State
+  const [editAccount, setEditAccount] = useState<AccountRow | null>(null);
+  const [editAccForm, setEditAccForm] = useState({ name_ar: '', name_en: '', lifecycle: 'ACTIVE' });
 
   const [refCode, setRefCode] = useState('');
   const [desc, setDesc] = useState('');
@@ -197,6 +214,10 @@ export default function GeneralLedgerPage() {
   }, [fromDate, toDate]);
 
   const load = useCallback(async () => {
+    if (!getAccessToken()) {
+      setErrorMsg(tr('يرجى تسجيل الدخول بحساب المالية أو المالك', 'Finance login required'));
+      return;
+    }
     try {
       const dq = buildDateQuery();
       const [accs, tb, jes, invs, stmts, fys] = await Promise.all([
@@ -254,6 +275,43 @@ export default function GeneralLedgerPage() {
       await load();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Verification failed');
+    }
+  };
+
+  const returnMilestone = async (milestoneId: string) => {
+    if (returnRemarks.trim().length < 2) {
+      setErrorMsg(tr('أدخل ملاحظات سبب الإرجاع للعميل', 'Provide return remarks for client'));
+      return;
+    }
+    setErrorMsg(null);
+    try {
+      await apiFetch(`/api/v1/erp/finance/milestones/${milestoneId}/return`, {
+        method: 'PATCH',
+        body: { remarks: returnRemarks.trim() },
+      });
+      setReturnTargetId(null);
+      setReturnRemarks('');
+      setNotice(tr('تم إرجاع الإيصال للعميل للتعديل وإرسال التنبيه.', 'Milestone receipt returned for amendment.'));
+      await load();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Return failed');
+    }
+  };
+
+  const handleSaveEditAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editAccount) return;
+    setErrorMsg(null);
+    try {
+      await apiFetch(`/api/v1/finance/accounts/${editAccount.id}`, {
+        method: 'PATCH',
+        body: editAccForm,
+      });
+      setEditAccount(null);
+      setNotice(tr('تم تحديث بيانات الحساب المحاسبي بنجاح', 'Account updated'));
+      await load();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to update account');
     }
   };
 
@@ -439,11 +497,10 @@ export default function GeneralLedgerPage() {
                 role="tab"
                 aria-selected={active}
                 onClick={() => setActiveTab(tb.id)}
-                className={`-mb-px inline-flex items-center gap-1.5 whitespace-nowrap border-b-2 px-1 py-3 text-xs transition ${
-                  active
-                    ? 'border-[var(--brand-primary)] font-semibold text-slate-900 dark:text-white'
-                    : 'border-transparent font-medium text-slate-500 hover:text-[var(--brand-primary,#D4AF37)]'
-                }`}
+                className={`-mb-px inline-flex items-center gap-1.5 whitespace-nowrap border-b-2 px-1 py-3 text-xs transition ${active
+                  ? 'border-[var(--brand-primary)] font-semibold text-slate-900 dark:text-white'
+                  : 'border-transparent font-medium text-slate-500 hover:text-[var(--brand-primary,#D4AF37)]'
+                  }`}
               >
                 <Icon className="h-4 w-4" />
                 <span>{isRtl ? tb.ar : tb.en}</span>
@@ -556,7 +613,39 @@ export default function GeneralLedgerPage() {
                           <CheckCircle2 className="h-4 w-4" />
                           <span>{tr('اعتماد وترحيل القيد', 'Verify & Post Journal')}</span>
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setReturnTargetId(m.id);
+                            setReturnRemarks('');
+                          }}
+                          className="flex min-h-[38px] items-center gap-1.5 rounded-lg bg-amber-500 px-3 font-bold text-slate-950"
+                        >
+                          <RotateCcw className="h-4 w-4" />
+                          <span>{tr('إعادة للتعديل', 'Return')}</span>
+                        </button>
                       </div>
+                      {m.reviewer_remarks && (
+                        <div className="w-full text-[11px] text-amber-500">
+                          {tr('ملاحظات الإعادة:', 'Remarks:')} {m.reviewer_remarks}
+                        </div>
+                      )}
+                      {returnTargetId === m.id && (
+                        <div className="flex w-full flex-wrap gap-2 border-t border-slate-200 pt-2 dark:border-slate-800">
+                          <input
+                            value={returnRemarks}
+                            onChange={(e) => setReturnRemarks(e.target.value)}
+                            placeholder={tr('سبب إرجاع الإيصال للعميل...', 'Reason for returning receipt...')}
+                            className="min-h-[36px] flex-1 rounded-lg border border-amber-500/50 bg-white px-2.5 text-xs dark:bg-slate-900"
+                          />
+                          <button type="button" onClick={() => returnMilestone(m.id)} className="rounded-lg bg-amber-500 px-3 py-1 font-bold text-slate-950">
+                            {tr('تأكيد الإعادة', 'Confirm Return')}
+                          </button>
+                          <button type="button" onClick={() => setReturnTargetId(null)} className="rounded-lg border border-slate-300 px-2.5 py-1 dark:border-slate-700">
+                            {tr('إلغاء', 'Cancel')}
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -692,9 +781,8 @@ export default function GeneralLedgerPage() {
                     className="rounded-lg border border-slate-300 bg-white px-2 py-1 dark:border-slate-700 dark:bg-slate-950"
                   />
                   <span
-                    className={`rounded-full px-3 py-1 font-bold ${
-                      tbBalanced ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'
-                    }`}
+                    className={`rounded-full px-3 py-1 font-bold ${tbBalanced ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'
+                      }`}
                   >
                     {tbBalanced ? tr('متوازن ✓', 'Balanced ✓') : tr('غير متوازن!', 'Unbalanced!')}
                   </span>
@@ -762,9 +850,8 @@ export default function GeneralLedgerPage() {
                     headerEn: 'Status',
                     render: (r) => (
                       <span
-                        className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
-                          r.status === 'REVERSED' ? 'bg-rose-500/20 text-rose-400' : 'bg-emerald-500/20 text-emerald-400'
-                        }`}
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${r.status === 'REVERSED' ? 'bg-rose-500/20 text-rose-400' : 'bg-emerald-500/20 text-emerald-400'
+                          }`}
                       >
                         {r.status}
                       </span>
@@ -774,22 +861,54 @@ export default function GeneralLedgerPage() {
                     key: 'rev',
                     headerAr: 'إجراء',
                     headerEn: 'Action',
-                    render: (r) =>
-                      r.status === 'POSTED' && !r.reversed_entry_id ? (
+                    render: (r) => (
+                      <div className="flex flex-wrap gap-1.5">
                         <button
                           type="button"
-                          onClick={() => reverseEntry(r.id, r.entry_number)}
-                          className="inline-flex items-center gap-1 rounded border border-amber-500/40 px-2 py-1 text-[11px] font-semibold text-amber-500"
+                          onClick={() => setExpandedJeId((prev) => (prev === r.id ? null : r.id))}
+                          className="rounded border border-slate-300 px-2 py-1 text-[11px] font-semibold dark:border-slate-700"
                         >
-                          <RotateCcw className="h-3 w-3" />
-                          <span>{tr('عكس', 'Reverse')}</span>
+                          {expandedJeId === r.id ? tr('إخفاء', 'Hide') : tr('السطور', 'Lines')}
                         </button>
-                      ) : (
-                        <span className="text-[11px] text-slate-500">-</span>
-                      ),
+                        {r.status === 'POSTED' && !r.reversed_entry_id && (
+                          <button
+                            type="button"
+                            onClick={() => reverseEntry(r.id, r.entry_number)}
+                            className="inline-flex items-center gap-1 rounded border border-amber-500/40 px-2 py-1 text-[11px] font-semibold text-amber-500"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>{tr('عكس', 'Reverse')}</span>
+                          </button>
+                        )}
+                      </div>
+                    ),
                   },
                 ]}
               />
+              {expandedJeId && (() => {
+                const je = entries.find((x) => x.id === expandedJeId);
+                if (!je || !je.lines?.length) return null;
+                return (
+                  <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-800 dark:bg-slate-950">
+                    <div className="mb-2 font-mono font-bold text-amber-500">
+                      {je.entry_number} — {je.description}
+                    </div>
+                    <div className="space-y-1">
+                      {je.lines.map((ln, idx) => (
+                        <div key={idx} className="flex flex-wrap justify-between border-b border-slate-200/60 py-1 dark:border-slate-800">
+                          <span>
+                            <strong className="font-mono">{ln.account_code}</strong> — {isRtl ? ln.account_name_ar : ln.account_name_en}
+                            {ln.memo ? ` (${ln.memo})` : ''}
+                          </span>
+                          <span dir="ltr" className="font-mono">
+                            {ln.debit > 0 ? `Dr ${ln.debit.toLocaleString()}` : `Cr ${ln.credit.toLocaleString()}`}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
             </SpotlightCard>
           </>
         )}
@@ -830,9 +949,8 @@ export default function GeneralLedgerPage() {
                   {tr('قائمة المركز المالي (Balance Sheet)', 'Balance Sheet')}
                 </SpotlightHeading>
                 <span
-                  className={`rounded-full px-2.5 py-0.5 text-[11px] font-bold ${
-                    statements.balance_sheet.is_balanced ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-                  }`}
+                  className={`rounded-full px-2.5 py-0.5 text-[11px] font-bold ${statements.balance_sheet.is_balanced ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
+                    }`}
                 >
                   {statements.balance_sheet.is_balanced ? 'A = L + E ✓' : 'Out of Balance'}
                 </span>
@@ -917,16 +1035,26 @@ export default function GeneralLedgerPage() {
                         <div className="font-mono font-bold">{p.name}</div>
                         <div className="text-[10px] text-slate-500">{p.status}</div>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => togglePeriodStatus(p.id, p.status === 'OPEN' ? 'LOCKED' : 'OPEN')}
-                        className={`inline-flex items-center gap-1 rounded px-2 py-1 text-[11px] font-bold ${
-                          p.status === 'OPEN' ? 'bg-amber-500/15 text-amber-500' : 'bg-emerald-500/15 text-emerald-500'
-                        }`}
-                      >
-                        {p.status === 'OPEN' ? <Lock className="h-3 w-3" /> : <Unlock className="h-3 w-3" />}
-                        <span>{p.status === 'OPEN' ? tr('قفل', 'Lock') : tr('فتح', 'Open')}</span>
-                      </button>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => togglePeriodStatus(p.id, p.status === 'OPEN' ? 'LOCKED' : 'OPEN')}
+                          className={`inline-flex items-center gap-1 rounded px-2 py-1 text-[11px] font-bold ${p.status === 'OPEN' ? 'bg-amber-500/15 text-amber-500' : 'bg-emerald-500/15 text-emerald-500'
+                            }`}
+                        >
+                          {p.status === 'OPEN' ? <Lock className="h-3 w-3" /> : <Unlock className="h-3 w-3" />}
+                          <span>{p.status === 'OPEN' ? tr('قفل', 'Lock') : tr('فتح', 'Open')}</span>
+                        </button>
+                        {p.status !== 'CLOSED' && (
+                          <button
+                            type="button"
+                            onClick={() => togglePeriodStatus(p.id, 'CLOSED')}
+                            className="rounded bg-rose-500/15 px-2 py-1 text-[10px] font-bold text-rose-500"
+                          >
+                            {tr('إغلاق', 'Close')}
+                          </button>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -970,11 +1098,71 @@ export default function GeneralLedgerPage() {
                       '-'
                     ),
                 },
+                {
+                  key: 'edit',
+                  headerAr: 'تعديل',
+                  headerEn: 'Edit',
+                  render: (a) => (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditAccount(a);
+                        setEditAccForm({ name_ar: a.name_ar, name_en: a.name_en, lifecycle: a.lifecycle || 'ACTIVE' });
+                      }}
+                      className="rounded border border-slate-300 px-2 py-1 text-[11px] font-semibold hover:border-[var(--brand-primary,#D4AF37)] dark:border-slate-700"
+                    >
+                      {tr('تعديل', 'Edit')}
+                    </button>
+                  ),
+                },
               ]}
             />
           </SpotlightCard>
         )}
       </main>
+
+      {/* Edit Account Modal */}
+      {editAccount && (
+        <div dir={isRtl ? 'rtl' : 'ltr'} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-sm">
+          <SpotlightCard className="w-full max-w-md space-y-4 text-start">
+            <div className="flex items-center justify-between">
+              <SpotlightHeading as="h3" className="text-base">
+                {tr(`تعديل الحساب (${editAccount.code})`, `Edit GL Account (${editAccount.code})`)}
+              </SpotlightHeading>
+              <button type="button" onClick={() => setEditAccount(null)} className="p-1 text-slate-400 hover:text-white">
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <form onSubmit={handleSaveEditAccount} className="space-y-3 text-xs">
+              <input
+                required
+                value={editAccForm.name_ar}
+                onChange={(e) => setEditAccForm({ ...editAccForm, name_ar: e.target.value })}
+                placeholder={tr('الاسم بالعربية', 'Arabic Name')}
+                className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+              />
+              <input
+                required
+                value={editAccForm.name_en}
+                onChange={(e) => setEditAccForm({ ...editAccForm, name_en: e.target.value })}
+                placeholder={tr('الاسم بالإنجليزية', 'English Name')}
+                className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+              />
+              <select
+                value={editAccForm.lifecycle}
+                onChange={(e) => setEditAccForm({ ...editAccForm, lifecycle: e.target.value })}
+                className="min-h-[40px] w-full rounded-lg border border-slate-300 bg-white px-3 dark:border-slate-700 dark:bg-slate-950"
+              >
+                <option value="ACTIVE">ACTIVE</option>
+                <option value="ARCHIVED">ARCHIVED</option>
+              </select>
+              <button type="submit" className="min-h-[40px] w-full rounded-lg bg-[var(--brand-primary,#D4AF37)] font-bold text-slate-950">
+                {tr('حفظ التعديلات', 'Save Changes')}
+              </button>
+            </form>
+          </SpotlightCard>
+        </div>
+      )}
 
       {/* Account Ledger Drill-Down Modal */}
       {ledgerDrawer && (
