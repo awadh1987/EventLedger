@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import AuthContext, get_current_auth, hash_password, require_roles
-from app.models.accounting import Invoice, PaymentMilestone
+from app.models.accounting import Invoice, InvoiceStatus, PaymentMilestone
 from app.models.events import AuditLog, Event
 from app.models.tenant import RecordLifecycle, SystemLookup, Tenant, TenantBranding
 from app.models.users import ClientCategory, ClientProfile, StaffRole, User, UserType
@@ -494,10 +494,11 @@ async def list_tenant_clients(
         await db.execute(select(PaymentMilestone).where(PaymentMilestone.tenant_id == auth.tenant_id))
     ).scalars().all()
 
-    inv_by_event = {inv.event_id: inv for inv in invoices}
+    inv_by_event = {inv.event_id: inv for inv in invoices if inv.status != InvoiceStatus.VOIDED}
     paid_by_inv: dict[uuid.UUID, Decimal] = {}
     for m in milestones:
-        paid_by_inv[m.invoice_id] = paid_by_inv.get(m.invoice_id, Decimal("0.00")) + Decimal(str(m.paid_amount))
+        if not m.is_security_deposit:
+            paid_by_inv[m.invoice_id] = paid_by_inv.get(m.invoice_id, Decimal("0.00")) + Decimal(str(m.paid_amount))
 
     stats_by_client: dict[uuid.UUID, dict] = {}
     for ev in events:

@@ -10,10 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import create_access_token, hash_password
-from app.models.accounting import AccountingConfig, AccountType, ChartOfAccount
+from app.models.accounting import AccountingConfig, AccountType, ChartOfAccount, default_normal_balance
+from app.models.base import utcnow
 from app.models.tenant import SubscriptionTier, SystemLookup, Tenant, TenantBranding
 from app.models.users import StaffProfile, StaffRole, User, UserType
 from app.models.venue import Hall
+from app.services.accounting_service import DoubleEntryService
 
 router = APIRouter(prefix="/api/v1/public", tags=["Public & SaaS Onboarding"])
 
@@ -51,23 +53,29 @@ DEFAULT_LOOKUPS = [
 
 async def seed_tenant_defaults(db: AsyncSession, tenant_id) -> None:
     default_accounts = [
-        ("1010", "الصندوق الرئيسي", "Main Cash Drawer", AccountType.ASSET, True),
-        ("1020", "البنك والمحافظ الإلكترونية", "Bank & E-Wallets", AccountType.ASSET, True),
-        ("1100", "ذمم العملاء", "Accounts Receivable", AccountType.ASSET, True),
-        ("2100", "تأمينات الأضرار المستردة", "Refundable Security Deposits", AccountType.LIABILITY, True),
-        ("2200", "ضريبة القيمة المضافة المستحقة", "Tax Payable", AccountType.LIABILITY, True),
-        ("4000", "إيرادات تأجير القاعات", "Hall Rental Revenue", AccountType.REVENUE, True),
-        ("4100", "إيرادات الضيافة والبوفيه", "Catering Revenue", AccountType.REVENUE, True),
-        ("5000", "تكلفة المواد الغذائية والضيافة", "Catering COGS", AccountType.EXPENSE, True),
+        ("1010", "الصندوق الرئيسي", "Main Cash Drawer", AccountType.ASSET, True, False),
+        ("1020", "البنك والمحافظ الإلكترونية", "Bank & E-Wallets", AccountType.ASSET, True, False),
+        ("1100", "ذمم العملاء", "Accounts Receivable", AccountType.ASSET, True, True),
+        ("2100", "تأمينات الأضرار المستردة", "Refundable Security Deposits", AccountType.LIABILITY, True, True),
+        ("2200", "ضريبة القيمة المضافة المستحقة", "Tax Payable", AccountType.LIABILITY, True, True),
+        ("3000", "رأس المال", "Owner's Capital", AccountType.EQUITY, True, False),
+        ("3100", "الأرباح المحتجزة", "Retained Earnings", AccountType.EQUITY, True, False),
+        ("4000", "إيرادات تأجير القاعات", "Hall Rental Revenue", AccountType.REVENUE, True, False),
+        ("4100", "إيرادات الضيافة والبوفيه", "Catering Revenue", AccountType.REVENUE, True, False),
+        ("4200", "إيرادات تعويض الأضرار", "Damage Recovery Revenue", AccountType.REVENUE, True, False),
+        ("5000", "تكلفة المواد الغذائية والضيافة", "Catering COGS", AccountType.EXPENSE, True, False),
+        ("5100", "مصروفات تشغيل الفعاليات", "Event Operating Expenses", AccountType.EXPENSE, True, False),
     ]
     acc_ids = {}
-    for code, ar, en, atype, is_sys in default_accounts:
+    for code, ar, en, atype, is_sys, is_ctrl in default_accounts:
         acc = ChartOfAccount(
             tenant_id=tenant_id,
             code=code,
             name_ar=ar,
             name_en=en,
             account_type=atype,
+            normal_balance=default_normal_balance(atype),
+            is_control_account=is_ctrl,
             is_system=is_sys,
         )
         db.add(acc)
@@ -85,8 +93,12 @@ async def seed_tenant_defaults(db: AsyncSession, tenant_id) -> None:
             hall_revenue_account_id=acc_ids["4000"],
             catering_revenue_account_id=acc_ids["4100"],
             catering_cogs_account_id=acc_ids["5000"],
+            damage_recovery_account_id=acc_ids["4200"],
+            general_expense_account_id=acc_ids["5100"],
         )
     )
+
+    await DoubleEntryService.ensure_fiscal_year_with_periods(db, tenant_id, utcnow().year)
 
     for cat, code, ar, en, order in DEFAULT_LOOKUPS:
         db.add(

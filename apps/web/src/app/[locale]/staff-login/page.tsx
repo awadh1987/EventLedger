@@ -19,6 +19,15 @@ export default function StaffLoginPage() {
   const { setSession } = useAuth();
 
   const showDemo = process.env.NEXT_PUBLIC_ENABLE_DEMO === 'true';
+  const demoAccounts: { label: string; id: string; pw: string }[] = (() => {
+    if (!showDemo || !process.env.NEXT_PUBLIC_DEMO_STAFF_ACCOUNTS) return [];
+    try {
+      const parsed = JSON.parse(process.env.NEXT_PUBLIC_DEMO_STAFF_ACCOUNTS);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  })();
   const [showConnect, setShowConnect] = useState(isNativeRuntime() && !getNativeWorkspace());
   const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
@@ -189,19 +198,14 @@ export default function StaffLoginPage() {
           )}
 
           <div className="border-t border-slate-200 pt-3 dark:border-slate-800">
-            {showDemo && (
+            {showDemo && demoAccounts.length > 0 && (
               <>
                 <p className="mb-2 flex items-center gap-1 text-[11px] font-semibold text-slate-500">
                   <KeyRound className="h-3.5 w-3.5" />
                   {isRtl ? 'حسابات التجربة السريعة:' : 'Quick Demo Accounts:'}
                 </p>
                 <div className="mb-3 grid grid-cols-2 gap-1.5 text-[11px]">
-                  {[
-                    { label: 'Owner', id: 'owner@almassa.eventledger.local', pw: 'Almassa@2026' },
-                    { label: 'Finance', id: 'finance@almassa.eventledger.local', pw: 'Finance@2026' },
-                    { label: 'Gate', id: 'gate@almassa.eventledger.local', pw: 'Gate@2026' },
-                    { label: 'Super Admin', id: 'admin@eventledger.cloud', pw: 'SuperAdmin@2026' },
-                  ].map((acc) => (
+                  {demoAccounts.map((acc) => (
                     <button
                       key={acc.label}
                       type="button"

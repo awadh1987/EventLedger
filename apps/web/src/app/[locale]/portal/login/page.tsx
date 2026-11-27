@@ -21,7 +21,10 @@ interface AuthResponse {
 }
 
 const showDemo = process.env.NEXT_PUBLIC_ENABLE_DEMO === 'true';
-const DEMO_CLIENT = { id: 'ahmed@client.local', pw: 'Client@2026' };
+const DEMO_CLIENT = {
+  id: process.env.NEXT_PUBLIC_DEMO_CLIENT_ID || '',
+  pw: process.env.NEXT_PUBLIC_DEMO_CLIENT_PW || '',
+};
 
 const inputCls =
   'min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950';
@@ -318,7 +321,7 @@ function ClientPortalLoginInner() {
               <button type="submit" disabled={loading} className={btnCls}>
                 {loading ? tr('جارٍ الدخول...', 'Signing in...') : tr('دخول', 'Sign In')}
               </button>
-              {showDemo && (
+              {showDemo && DEMO_CLIENT.id && DEMO_CLIENT.pw && (
                 <button
                   type="button"
                   onClick={() => {

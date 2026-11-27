@@ -4,6 +4,7 @@ import os
 
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal, engine
 from app.core.security import hash_password
 from app.models.base import Base
@@ -16,7 +17,7 @@ from app.models.users import User, UserType
 
 
 def _require_env(name: str) -> str:
-    val = os.getenv(name, "").strip()
+    val = (os.getenv(name) or getattr(settings, name, "") or "").strip()
     if not val:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return val
@@ -26,7 +27,7 @@ async def bootstrap_production() -> None:
     email = _require_env("SUPER_ADMIN_EMAIL").lower()
     phone = _require_env("SUPER_ADMIN_PHONE")
     password = _require_env("SUPER_ADMIN_PASSWORD")
-    full_name = os.getenv("SUPER_ADMIN_NAME", "Platform Super Admin").strip()
+    full_name = (os.getenv("SUPER_ADMIN_NAME") or settings.SUPER_ADMIN_NAME or "Platform Super Admin").strip()
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

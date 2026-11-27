@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import os
 import secrets
 import uuid
@@ -14,7 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.models.users import StaffProfile, StaffRole, User, UserType
+from app.models.events import Event
+from app.models.users import EventDelegate, StaffProfile, StaffRole, User, UserType
 
 bearer_scheme = HTTPBearer(auto_error=False)
 _OTP_STORE: dict[str, tuple[str, datetime, str]] = {}
@@ -149,3 +151,100 @@ def require_roles(allowed_user_types: set[UserType], allowed_staff_roles: Option
         return auth
 
     return _guard
+
+
+def create_receipt_upload_token(tenant_id: uuid.UUID, milestone_id: uuid.UUID, jti: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(hours=48)
+    payload = {
+        "sub": "receipt_upload",
+        "tenant_id": str(tenant_id),
+        "milestone_id": str(milestone_id),
+        "jti": jti,
+        "exp": expire,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+def verify_receipt_upload_token(token: str, tenant_id: uuid.UUID, milestone_id: uuid.UUID) -> str:
+    try:
+        claims = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+    except PyJWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired receipt upload token")
+    if (
+        claims.get("sub") != "receipt_upload"
+        or claims.get("tenant_id") != str(tenant_id)
+        or claims.get("milestone_id") != str(milestone_id)
+        or not claims.get("jti")
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload token scope mismatch")
+    return str(claims["jti"])
+
+
+def verify_whatsapp_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
+    secret = (settings.WHATSAPP_APP_SECRET or "").strip()
+    if not secret:
+        return False
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    provided = signature_header.split("=", 1)[1].strip()
+    return secrets.compare_digest(expected, provided)
+
+
+async def get_accessible_event_ids(db: AsyncSession, auth: AuthContext) -> set[uuid.UUID]:
+    primary_ids = (
+        await db.execute(
+            select(Event.id).where(Event.tenant_id == auth.tenant_id, Event.primary_client_id == auth.user.id)
+        )
+    ).scalars().all()
+    delegate_ids = (
+        await db.execute(
+            select(EventDelegate.event_id).where(
+                EventDelegate.tenant_id == auth.tenant_id,
+                EventDelegate.user_id == auth.user.id,
+            )
+        )
+    ).scalars().all()
+    return set(primary_ids) | set(delegate_ids)
+
+
+async def verify_event_access(
+    db: AsyncSession,
+    auth: AuthContext,
+    event_id: uuid.UUID,
+    required_delegate_perm: Optional[str] = None,
+    primary_client_or_staff_only: bool = False,
+) -> Event:
+    event = (
+        await db.execute(select(Event).where(Event.id == event_id, Event.tenant_id == auth.tenant_id))
+    ).scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    if auth.user.user_type in (UserType.SUPER_ADMIN, UserType.INTERNAL_STAFF):
+        return event
+
+    if event.primary_client_id == auth.user.id:
+        return event
+
+    if primary_client_or_staff_only:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the primary client or staff may perform this action")
+
+    delegate = (
+        await db.execute(
+            select(EventDelegate).where(
+                EventDelegate.event_id == event_id,
+                EventDelegate.tenant_id == auth.tenant_id,
+                EventDelegate.user_id == auth.user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if not delegate:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this event")
+
+    if required_delegate_perm and not (delegate.permissions or {}).get(required_delegate_perm, False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Delegate lacks required permission: {required_delegate_perm}",
+        )
+    return event

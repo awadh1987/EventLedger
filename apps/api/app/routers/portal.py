@@ -4,13 +4,14 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import AuthContext, get_current_auth
+from app.core.security import AuthContext, get_accessible_event_ids, get_current_auth, verify_event_access
 from app.models.accounting import Invoice, PaymentMilestone
 from app.models.events import AuditLog, Event
 from app.models.tenant import Tenant
@@ -203,6 +204,7 @@ async def list_portal_events(auth: AuthContext = Depends(get_current_auth), db: 
                             "payment_method": m.payment_method,
                             "receipt_url": m.receipt_url,
                             "status": m.status,
+                            "is_security_deposit": bool(m.is_security_deposit),
                         }
                         for m in milestones
                     ],
@@ -234,6 +236,7 @@ async def list_event_delegates(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    await verify_event_access(db, auth, event_id)
     rows = (
         await db.execute(
             select(EventDelegate, User)
@@ -334,6 +337,7 @@ async def remove_event_delegate(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    await verify_event_access(db, auth, event_id, primary_client_or_staff_only=True)
     deleg = (
         await db.execute(
             select(EventDelegate).where(
@@ -359,7 +363,16 @@ async def list_audit_logs(
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
     query = select(AuditLog, User.full_name).join(User, AuditLog.actor_id == User.id).where(AuditLog.tenant_id == auth.tenant_id)
-    if event_id:
+    if auth.user.user_type not in (UserType.INTERNAL_STAFF, UserType.SUPER_ADMIN):
+        if event_id:
+            await verify_event_access(db, auth, event_id)
+            query = query.where(AuditLog.event_id == event_id)
+        else:
+            accessible_ids = await get_accessible_event_ids(db, auth)
+            if not accessible_ids:
+                return []
+            query = query.where(AuditLog.event_id.in_(accessible_ids))
+    elif event_id:
         query = query.where(AuditLog.event_id == event_id)
     rows = (await db.execute(query.order_by(AuditLog.created_at.desc()).limit(100))).all()
     return [
@@ -403,8 +416,9 @@ async def save_milestone_receipt(
     fname = f"{milestone.id}_{uuid.uuid4().hex[:8]}{ext}"
     (upload_dir / fname).write_bytes(data)
 
-    milestone.receipt_url = f"/uploads/receipts/{fname}"
+    milestone.receipt_url = f"/api/v1/portal/milestones/{milestone.id}/receipt?file={fname}"
     milestone.status = "UNDER_REVIEW"
+    milestone.upload_token_jti = None
     if payment_method and payment_method.strip():
         milestone.payment_method = payment_method.strip()[:60]
     ref = (transfer_reference or "").strip()[:80]
@@ -454,7 +468,49 @@ async def upload_milestone_receipt(
     ).scalar_one_or_none()
     if not milestone:
         raise HTTPException(status_code=404, detail="Milestone not found")
+    inv = (
+        await db.execute(select(Invoice).where(Invoice.id == milestone.invoice_id, Invoice.tenant_id == auth.tenant_id))
+    ).scalar_one_or_none()
+    if inv:
+        await verify_event_access(db, auth, inv.event_id, required_delegate_perm="canViewFinance")
     return await save_milestone_receipt(db, milestone, upload, payment_method, transfer_reference, auth.user.id)
+
+
+@portal_router.get("/milestones/{milestone_id}/receipt")
+async def download_milestone_receipt(
+    milestone_id: uuid.UUID,
+    file: Optional[str] = Query(default=None),
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not auth.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    milestone = (
+        await db.execute(
+            select(PaymentMilestone).where(
+                PaymentMilestone.id == milestone_id,
+                PaymentMilestone.tenant_id == auth.tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if not milestone or not milestone.receipt_url:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+
+    inv = (
+        await db.execute(select(Invoice).where(Invoice.id == milestone.invoice_id, Invoice.tenant_id == auth.tenant_id))
+    ).scalar_one_or_none()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    await verify_event_access(db, auth, inv.event_id, required_delegate_perm="canViewFinance")
+
+    upload_dir = (Path(settings.UPLOAD_DIR) / "receipts").resolve()
+    target_name = Path(file).name if file else Path(milestone.receipt_url.split("file=")[-1]).name
+    if not target_name or not target_name.startswith(f"{milestone.id}_"):
+        raise HTTPException(status_code=403, detail="Invalid receipt filename")
+    target_path = (upload_dir / target_name).resolve()
+    if upload_dir not in target_path.parents or not target_path.is_file():
+        raise HTTPException(status_code=404, detail="Receipt file missing on disk")
+    return FileResponse(target_path)
 
 
 @portal_router.get("/payment-accounts")

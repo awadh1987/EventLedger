@@ -1,7 +1,7 @@
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -9,10 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import AuthContext, get_current_auth, require_roles
-from app.models.accounting import ChartOfAccount, JournalEntry
+from app.core.security import AuthContext, get_current_auth, require_roles, verify_event_access, verify_whatsapp_signature
+from app.models.accounting import ChartOfAccount, Invoice, JournalEntry
 from app.models.events import DraftStatus, DraftType, Event, EventDraft, EventMessage, GatePass
-from app.models.users import User, UserType
+from app.models.users import StaffRole, User, UserType
 from app.models.venue import EventInventoryAllocation, Hall, InventoryItem
 from app.services.accounting_service import DoubleEntryService
 from app.services.comms_service import CommsService
@@ -40,8 +40,12 @@ async def bulk_import_csv(
         raise HTTPException(status_code=400, detail="Tenant context required")
     raw = await file.read()
     if entity_type == "accounts":
+        if auth.staff_role not in (StaffRole.OWNER, StaffRole.FINANCE) and auth.user.user_type != UserType.SUPER_ADMIN:
+            raise HTTPException(status_code=403, detail="Only OWNER or FINANCE may import Chart of Accounts")
         return await ImportExportService.import_chart_of_accounts_csv(db, auth.tenant_id, raw)
     if entity_type == "inventory":
+        if auth.staff_role not in (StaffRole.OWNER, StaffRole.OPS_MANAGER, StaffRole.FINANCE) and auth.user.user_type != UserType.SUPER_ADMIN:
+            raise HTTPException(status_code=403, detail="Insufficient role for inventory import")
         return await ImportExportService.import_inventory_csv(db, auth.tenant_id, raw)
     if entity_type == "guests":
         if not event_id:
@@ -136,6 +140,12 @@ async def export_invoice_pdf(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    inv = (
+        await db.execute(select(Invoice).where(Invoice.id == invoice_id, Invoice.tenant_id == auth.tenant_id))
+    ).scalar_one_or_none()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    await verify_event_access(db, auth, inv.event_id, required_delegate_perm="canViewFinance")
     pdf_bytes = await ImportExportService.render_invoice_pdf(db, auth.tenant_id, invoice_id, locale)
     return Response(
         content=pdf_bytes,
@@ -169,6 +179,7 @@ async def list_event_messages(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    await verify_event_access(db, auth, event_id)
     q = (
         select(EventMessage, User.full_name)
         .join(User, EventMessage.sender_id == User.id)
@@ -202,6 +213,7 @@ async def create_event_message(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    await verify_event_access(db, auth, event_id, required_delegate_perm="canChat")
     is_internal = body.is_internal if auth.user.user_type == UserType.INTERNAL_STAFF else False
     msg = await CommsService.post_message(
         db, auth.tenant_id, event_id, auth.user.id, body.content, body.channel, body.department, is_internal
@@ -225,7 +237,12 @@ async def verify_whatsapp_webhook(
 
 
 @router.post("/webhooks/whatsapp")
-async def whatsapp_webhook(payload: dict, db: AsyncSession = Depends(get_db)):
+async def whatsapp_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    raw_body = await request.body()
+    sig = request.headers.get("x-hub-signature-256")
+    if not verify_whatsapp_signature(raw_body, sig):
+        raise HTTPException(status_code=403, detail="Invalid or missing WhatsApp webhook signature")
+    payload = await request.json()
     return await CommsService.ingest_whatsapp_webhook(db, payload)
 
 

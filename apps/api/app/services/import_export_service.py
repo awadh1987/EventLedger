@@ -172,7 +172,7 @@ class ImportExportService:
             f"<div>#{invoice.invoice_number} | {tenant.currency}</div></div>"
             f"<table><thead><tr><th>{'البيان' if is_rtl else 'Description'}</th>"
             f"<th>{'المبلغ' if is_rtl else 'Amount'}</th></tr></thead><tbody>"
-            f"<tr><td>{'المجموع الفرعي' if is_rtl else 'Subtotal'}</td><td>{invoice.subtotal:,.2f} {tenant.currency}</td></tr>"
+            f"<tr><td>{'المجموع الفرعي' if is_rtl else 'Subtotal'}</td><td>{(invoice.subtotal + invoice.discount_amount):,.2f} {tenant.currency}</td></tr>"
             f"<tr><td>{'الخصم' if is_rtl else 'Discount'}</td><td>-{invoice.discount_amount:,.2f} {tenant.currency}</td></tr>"
             f"<tr><td>{'الضريبة' if is_rtl else 'Tax'}</td><td>{invoice.tax_amount:,.2f} {tenant.currency}</td></tr>"
             f"<tr><td><strong>{'الإجمالي المستحق' if is_rtl else 'Total Due'}</strong></td>"

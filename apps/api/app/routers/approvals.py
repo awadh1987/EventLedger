@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import AuthContext, get_current_auth
+from app.core.security import AuthContext, get_current_auth, verify_event_access
 from app.models.events import ApprovalRequest, ApprovalStatus, DraftType, Event, EventDraft
 from app.models.users import User, UserType
 from app.services.approvals_service import ApprovalsService
@@ -27,6 +27,16 @@ class ResolveApprovalBody(BaseModel):
     rejection_reason: Optional[str] = None
 
 
+def _draft_delegate_perm(draft_type: DraftType) -> Optional[str]:
+    if draft_type == DraftType.FLOOR_PLAN:
+        return "canEditFloorplan"
+    if draft_type == DraftType.ADDON_REQUEST:
+        return "canRequestAddons"
+    if draft_type == DraftType.CATERING_MENU:
+        return "canEditCatering"
+    return None
+
+
 @router.post("/events/{event_id}/drafts")
 async def create_event_draft(
     event_id: uuid.UUID,
@@ -36,11 +46,7 @@ async def create_event_draft(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
-    ev = (
-        await db.execute(select(Event).where(Event.id == event_id, Event.tenant_id == auth.tenant_id))
-    ).scalar_one_or_none()
-    if not ev:
-        raise HTTPException(status_code=404, detail="Event not found")
+    await verify_event_access(db, auth, event_id, required_delegate_perm=_draft_delegate_perm(body.draft_type))
 
     max_v = (
         await db.execute(
@@ -72,6 +78,7 @@ async def list_event_drafts(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    await verify_event_access(db, auth, event_id)
     rows = (
         await db.execute(
             select(EventDraft, User.full_name)
@@ -103,6 +110,12 @@ async def submit_draft(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    draft = (
+        await db.execute(select(EventDraft).where(EventDraft.id == draft_id, EventDraft.tenant_id == auth.tenant_id))
+    ).scalar_one_or_none()
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    await verify_event_access(db, auth, draft.event_id, required_delegate_perm=_draft_delegate_perm(draft.draft_type))
     approval, draft_status = await ApprovalsService.submit_draft_for_approval(
         db, auth.tenant_id, draft_id, auth.user.id, auth.user.user_type.value
     )
@@ -162,5 +175,12 @@ async def resolve_approval(
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
     return await ApprovalsService.resolve_approval(
-        db, auth.tenant_id, approval_id, auth.user.id, body.decision, body.rejection_reason
+        db=db,
+        tenant_id=auth.tenant_id,
+        approval_id=approval_id,
+        approver_id=auth.user.id,
+        approver_user_type=auth.user.user_type,
+        approver_staff_role=auth.staff_role,
+        decision=body.decision,
+        rejection_reason=body.rejection_reason,
     )

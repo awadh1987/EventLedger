@@ -427,6 +427,8 @@ async def seed_all() -> None:
             reference="INV-2026-1001",
             description="استحقاق فاتورة حجز قاعة الماسة الكبرى / Invoice accrual for EVT-2026-1001",
             event_id=ev.id,
+            is_system_posting=True,
+            idempotency_key=f"SEED_INV:{inv.id}",
             lines=[
                 {
                     "account_id": cfg.accounts_receivable_id,
@@ -456,6 +458,8 @@ async def seed_all() -> None:
             reference="PAY-INV-2026-1001-M1",
             description="تحصيل الدفعة الأولى (50%) عبر الكريمي / Verified 50% milestone via KURAIMI",
             event_id=ev.id,
+            is_system_posting=True,
+            idempotency_key=f"SEED_PAY:{inv.id}:M1",
             lines=[
                 {
                     "account_id": cfg.bank_account_id,
@@ -479,6 +483,8 @@ async def seed_all() -> None:
             reference="DEP-INV-2026-1001",
             description="تأمين الأضرار المسترد (التزامات 2100) / Refundable security deposit held in Liability 2100",
             event_id=ev.id,
+            is_system_posting=True,
+            idempotency_key=f"SEED_DEP:{inv.id}",
             lines=[
                 {
                     "account_id": cfg.bank_account_id,
@@ -494,6 +500,7 @@ async def seed_all() -> None:
                 },
             ],
         )
+        await db.commit()
 
         print("Seed completed for tenant: almassa")
 

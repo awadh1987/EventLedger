@@ -156,7 +156,7 @@ async def test_end_to_end_api_invariants():
                 "description": "Balanced test",
                 "lines": [
                     {"account_id": acc_by_code["1020"], "debit": 5000, "credit": 0},
-                    {"account_id": acc_by_code["2100"], "debit": 0, "credit": 5000},
+                    {"account_id": acc_by_code["3000"], "debit": 0, "credit": 5000},
                 ],
             },
         )
@@ -266,9 +266,16 @@ async def test_end_to_end_api_invariants():
 
         # 10. Phase 2: Client contract e-signature & guest QR pass creation
         r = await client.post(
-            "/api/v1/auth/login",
+            "/api/v1/auth/otp-request",
             headers=headers,
-            json={"identifier": "+967775556677", "password": "Client@2026"},
+            json={"identifier": "+967775556677"},
+        )
+        assert r.status_code == 200
+        dev_otp = r.json()["dev_otp"]
+        r = await client.post(
+            "/api/v1/auth/otp-login",
+            headers=headers,
+            json={"identifier": "+967775556677", "otp_code": dev_otp},
         )
         assert r.status_code == 200
         client_headers = {**headers, "Authorization": f"Bearer {r.json()['access_token']}"}

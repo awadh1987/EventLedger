@@ -85,6 +85,7 @@ export interface MilestoneInfo {
   payment_method: string | null;
   receipt_url: string | null;
   status: string;
+  is_security_deposit?: boolean;
 }
 
 export interface PortalEvent {

@@ -300,7 +300,9 @@ export default function ClientPortalDashboard() {
     let escrowDeposit = 0;
     for (const ev of events) {
       if (!ev.invoice) continue;
-      const paid = ev.invoice.milestones.reduce((s, m) => s + Number(m.paid_amount || 0), 0);
+      const paid = ev.invoice.milestones
+        .filter((m) => !m.is_security_deposit)
+        .reduce((s, m) => s + Number(m.paid_amount || 0), 0);
       remainingBalance += Math.max(0, Number(ev.invoice.total_amount || 0) - paid);
       escrowDeposit += Number(ev.invoice.security_deposit_amount || 0);
     }

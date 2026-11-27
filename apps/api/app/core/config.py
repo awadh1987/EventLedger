@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     S3_BUCKET: str = "eventledger-assets"
     WHATSAPP_API_URL: str = "https://graph.facebook.com/v20.0"
     WHATSAPP_WEBHOOK_VERIFY_TOKEN: str = "eventledger_wa_verify_token"
+    WHATSAPP_APP_SECRET: str = ""
+    SUPER_ADMIN_EMAIL: str = ""
+    SUPER_ADMIN_PHONE: str = ""
+    SUPER_ADMIN_PASSWORD: str = ""
+    SUPER_ADMIN_NAME: str = "Platform Super Admin"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

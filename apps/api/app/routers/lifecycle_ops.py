@@ -9,8 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import AuthContext, get_current_auth, require_roles
-from app.models.accounting import DepositStatus, Invoice, InvoiceStatus, PaymentMilestone
+from app.core.security import AuthContext, get_current_auth, require_roles, verify_event_access
+from app.models.accounting import AccountingConfig, DepositStatus, Invoice
 from app.models.base import utcnow
 from app.models.events import AuditLog, Event, EventStatus, GatePass
 from app.models.events_extensions import DamageInspection, EventContract, EventGuest, InspectionStatus, RsvpStatus
@@ -53,6 +53,7 @@ async def get_event_contract(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    await verify_event_access(db, auth, event_id)
 
     contract = (
         await db.execute(
@@ -88,6 +89,7 @@ async def sign_event_contract(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    await verify_event_access(db, auth, event_id, primary_client_or_staff_only=True)
 
     contract = (
         await db.execute(
@@ -129,6 +131,7 @@ async def list_event_guests(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    await verify_event_access(db, auth, event_id)
 
     rows = (
         await db.execute(
@@ -164,12 +167,7 @@ async def add_guest_with_qr_pass(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
-
-    ev = (
-        await db.execute(select(Event).where(Event.id == event_id, Event.tenant_id == auth.tenant_id))
-    ).scalar_one_or_none()
-    if not ev:
-        raise HTTPException(status_code=404, detail="Event not found")
+    ev = await verify_event_access(db, auth, event_id, required_delegate_perm="canManageGuests")
 
     qr_token = f"QR-{ev.event_code}-{str(uuid.uuid4().int % 100000).zfill(5)}"
     gate_pass = GatePass(
@@ -209,64 +207,15 @@ async def verify_payment_milestone(
 ):
     if not auth.tenant_id:
         raise HTTPException(status_code=400, detail="Tenant context required")
-
-    ms = (
-        await db.execute(
-            select(PaymentMilestone).where(
-                PaymentMilestone.id == milestone_id,
-                PaymentMilestone.tenant_id == auth.tenant_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if not ms:
-        raise HTTPException(status_code=404, detail="Payment milestone not found")
-
-    inv = (
-        await db.execute(select(Invoice).where(Invoice.id == ms.invoice_id, Invoice.tenant_id == auth.tenant_id))
-    ).scalar_one_or_none()
-    if not inv:
-        raise HTTPException(status_code=404, detail="Invoice not found in tenant")
-
-    ms.paid_amount = ms.amount_due
-    ms.payment_method = body.payment_method
-    ms.status = "PAID"
-    ms.paid_at = utcnow()
-    await db.flush()
-
-    if body.is_security_deposit:
-        inv.deposit_status = DepositStatus.HELD
-    else:
-        all_ms = (
-            await db.execute(
-                select(PaymentMilestone).where(
-                    PaymentMilestone.invoice_id == inv.id,
-                    PaymentMilestone.tenant_id == auth.tenant_id,
-                )
-            )
-        ).scalars().all()
-        total_paid = sum((Decimal(str(m.paid_amount)) for m in all_ms), Decimal("0.00"))
-        inv.status = InvoiceStatus.PAID if total_paid >= Decimal(str(inv.total_amount)) else InvoiceStatus.PARTIALLY_PAID
-
-        ev = (
-            await db.execute(select(Event).where(Event.id == inv.event_id, Event.tenant_id == auth.tenant_id))
-        ).scalar_one_or_none()
-        if ev and ev.status == EventStatus.HOLD_48H:
-            ev.status = EventStatus.CONFIRMED
-
-    await db.flush()
-
-    je = await DoubleEntryService.record_verified_payment(
+    return await DoubleEntryService.verify_milestone_payment(
         db=db,
         tenant_id=auth.tenant_id,
         user_id=auth.user.id,
-        event_id=inv.event_id,
-        amount=Decimal(str(ms.amount_due)),
-        is_security_deposit=body.is_security_deposit,
+        milestone_id=milestone_id,
         payment_method=body.payment_method,
-        reference=f"{inv.invoice_number} — {body.reference}",
+        is_security_deposit=body.is_security_deposit,
+        reference=body.reference,
     )
-
-    return {"status": "VERIFIED", "invoice_status": inv.status.value, "journal_entry_number": je.entry_number}
 
 
 @router.post("/erp/ops/events/{event_id}/inspection")
@@ -285,13 +234,63 @@ async def submit_damage_inspection(
     if not ev:
         raise HTTPException(status_code=404, detail="Event not found")
 
+    deduction = Decimal(str(body.deduction_amount)).quantize(Decimal("0.01"))
+    if deduction < Decimal("0.00"):
+        raise HTTPException(status_code=400, detail="deduction_amount cannot be negative")
+
     inv = (
-        await db.execute(select(Invoice).where(Invoice.event_id == event_id, Invoice.tenant_id == auth.tenant_id))
-    ).scalar_one_or_none()
-    if inv:
-        inv.deposit_status = (
-            DepositStatus.INSPECTION_PASSED if body.status == InspectionStatus.PASSED else DepositStatus.DEDUCTED
+        await db.execute(
+            select(Invoice)
+            .where(Invoice.event_id == event_id, Invoice.tenant_id == auth.tenant_id)
+            .with_for_update()
         )
+    ).scalar_one_or_none()
+
+    if inv:
+        if body.status == InspectionStatus.DAMAGE_CLAIMED and deduction > Decimal("0.00"):
+            if deduction > Decimal(str(inv.security_deposit_amount)):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Deduction amount cannot exceed held security deposit amount",
+                )
+            cfg = (
+                await db.execute(select(AccountingConfig).where(AccountingConfig.tenant_id == auth.tenant_id))
+            ).scalar_one_or_none()
+            if not cfg or not cfg.security_deposit_liab_id:
+                raise HTTPException(status_code=400, detail="AccountingConfig missing security deposit account")
+            recovery_acc = cfg.damage_recovery_account_id or cfg.hall_revenue_account_id
+            if not recovery_acc:
+                raise HTTPException(status_code=400, detail="AccountingConfig missing damage recovery revenue account")
+
+            await DoubleEntryService.post_balanced_entry(
+                db=db,
+                tenant_id=auth.tenant_id,
+                created_by_id=auth.user.id,
+                reference=f"DMG-{inv.invoice_number}",
+                description=f"Post-event damage deduction for {ev.event_code}",
+                event_id=event_id,
+                is_system_posting=True,
+                idempotency_key=f"DAMAGE_DEDUCT:{event_id}",
+                lines=[
+                    {
+                        "account_id": cfg.security_deposit_liab_id,
+                        "debit": deduction,
+                        "credit": Decimal("0.00"),
+                        "memo": "Deduct damage claim from security deposit 2100",
+                    },
+                    {
+                        "account_id": recovery_acc,
+                        "debit": Decimal("0.00"),
+                        "credit": deduction,
+                        "memo": "Damage recovery revenue",
+                    },
+                ],
+            )
+            inv.deposit_status = DepositStatus.DEDUCTED
+        else:
+            inv.deposit_status = (
+                DepositStatus.INSPECTION_PASSED if body.status == InspectionStatus.PASSED else DepositStatus.DEDUCTED
+            )
 
     ev.status = EventStatus.COMPLETED
 
@@ -306,7 +305,7 @@ async def submit_damage_inspection(
     if inspection:
         inspection.inspected_by_id = auth.user.id
         inspection.checklist_json = body.checklist_json
-        inspection.deduction_amount = body.deduction_amount
+        inspection.deduction_amount = deduction
         inspection.notes = body.notes
         inspection.status = body.status
         inspection.inspected_at = utcnow()
@@ -316,7 +315,7 @@ async def submit_damage_inspection(
             event_id=event_id,
             inspected_by_id=auth.user.id,
             checklist_json=body.checklist_json,
-            deduction_amount=body.deduction_amount,
+            deduction_amount=deduction,
             notes=body.notes,
             status=body.status,
         )
@@ -328,7 +327,7 @@ async def submit_damage_inspection(
             event_id=event_id,
             actor_id=auth.user.id,
             action="POST_EVENT_DAMAGE_INSPECTION",
-            new_value={"status": body.status.value, "deduction_amount": float(body.deduction_amount)},
+            new_value={"status": body.status.value, "deduction_amount": float(deduction)},
         )
     )
     await db.commit()

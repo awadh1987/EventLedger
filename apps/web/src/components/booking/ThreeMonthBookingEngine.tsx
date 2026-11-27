@@ -81,10 +81,11 @@ type TenantDetail = CatalogFields;
 interface HoldResponse {
   event_code: string;
   hold_expires_at: string;
+  portal_auth_hint?: string;
   quote: { total_amount: number; security_deposit_amount: number; currency: string };
   invoice: { invoice_number: string };
   contract: { contract_number: string };
-  milestones: { id: string; title: string; amount_due: number; due_date: string; status: string }[];
+  milestones: { id: string; title: string; amount_due: number; due_date: string; status: string; upload_token?: string | null }[];
   payment_accounts: PaymentAccount[];
 }
 
@@ -488,6 +489,7 @@ export default function ThreeMonthBookingEngine({
             end_time: `${selected.date}T${sess.end}:00`,
             guest_count: guests,
             catering_item_id: cateringId || null,
+            offer_id: appliedOffer?.id || null,
             addons,
             payment_mode: payMode === 'HOLD' ? 'HOLD_48H' : 'IMMEDIATE_DEPOSIT',
             selected_payment_method: payMode === 'HOLD' ? 'PAY_LATER_48H' : payMethod,
@@ -509,6 +511,7 @@ export default function ThreeMonthBookingEngine({
         try {
           const fd = new FormData();
           fd.append('receipt', receiptFile);
+          if (firstMilestone.upload_token) fd.append('upload_token', firstMilestone.upload_token);
           fd.append('payment_method', payMethod);
           if (transferRef.trim()) fd.append('transfer_reference', transferRef.trim());
           const up = await apiFetch<ReceiptResponse>(
@@ -776,6 +779,13 @@ export default function ThreeMonthBookingEngine({
                   {row(t('deposit'), money(result.quote.security_deposit_amount, result.quote.currency))}
                   {row(t('expires'), new Date(result.hold_expires_at + 'Z').toLocaleString(isAr ? 'ar-YE-u-nu-latn' : 'en-US'))}
                 </div>
+                {result.portal_auth_hint === 'OTP_LOGIN_REQUIRED' && (
+                  <p className="rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">
+                    {isAr
+                      ? 'للدخول إلى بوابة العميل وتوقيع العقد، استخدم تسجيل الدخول برمز التحقق (OTP) عبر رقم هاتفك.'
+                      : 'To access the Client Portal and sign your contract, use OTP login with your phone number.'}
+                  </p>
+                )}
                 <ul className="space-y-1 text-sm">
                   {result.milestones.map((m) => (
                     <li key={m.title} className="flex justify-between gap-2">

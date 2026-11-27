@@ -1,4 +1,5 @@
 import enum
+import secrets
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -11,15 +12,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import AuthContext, hash_password, require_roles
+from app.core.security import (
+    AuthContext,
+    create_receipt_upload_token,
+    hash_password,
+    require_roles,
+    verify_receipt_upload_token,
+)
 from app.models.accounting import DepositStatus, Invoice, InvoiceStatus, PaymentMilestone
 from app.models.base import RecordLifecycle, utcnow
 from app.models.events import AuditLog, Event, EventStatus
 from app.models.events_extensions import EventContract
-from app.models.users import ClientCategory, ClientProfile, User, UserType
 from app.models.tenant import Tenant, TenantBranding
-from app.models.venue import CateringMenuItem, Hall, InventoryItem, PricingRule
+from app.models.users import ClientCategory, ClientProfile, StaffRole, User, UserType
+from app.models.venue import CateringMenuItem, EventInventoryAllocation, Hall, InventoryItem, PricingRule
 from app.routers.portal import save_milestone_receipt
+from app.services.accounting_service import DoubleEntryService
 from app.services.availability_service import AvailabilityService
 
 router = APIRouter(prefix="/api/v1", tags=["Tier 2: Reservation, Partition Merge & 48h Hold Engine"])
@@ -43,7 +51,7 @@ class PaymentMethodCode(str, enum.Enum):
 class HoldAddonItem(BaseModel):
     item_id: uuid.UUID
     quantity: int = Field(default=1, ge=1)
-    unit_price: Decimal = Field(default=Decimal("0.00"), ge=0)
+    unit_price: Optional[Decimal] = Field(default=None, ge=0)
 
 
 DEFAULT_PAYMENT_ACCOUNTS = [
@@ -73,6 +81,7 @@ class PublicHoldBookingRequest(BaseModel):
     end_time: datetime
     guest_count: int = Field(default=250, ge=10)
     catering_item_id: Optional[uuid.UUID] = None
+    offer_id: Optional[str] = None
     addon_amount: Decimal = Decimal("0.00")
     client_full_name: str = Field(..., min_length=2)
     client_phone: str = Field(..., min_length=7)
@@ -212,6 +221,19 @@ async def create_public_or_staff_48h_hold(
     if naive_end <= naive_start:
         raise HTTPException(status_code=400, detail="end_time must be after start_time")
 
+    # Lock hall row(s) during booking creation to serialize concurrent bookings on the same hall
+    hall_row = (
+        await db.execute(select(Hall).where(Hall.id == body.hall_id, Hall.tenant_id == tenant.id).with_for_update())
+    ).scalar_one_or_none()
+    if not hall_row:
+        raise HTTPException(status_code=404, detail="Hall not found")
+    if hall_row.combinable_with_hall_id:
+        await db.execute(
+            select(Hall.id)
+            .where(Hall.id == hall_row.combinable_with_hall_id, Hall.tenant_id == tenant.id)
+            .with_for_update()
+        )
+
     avail = await AvailabilityService.check_hall_availability(db, tenant.id, body.hall_id, naive_start, naive_end)
     if not avail["available"]:
         raise HTTPException(
@@ -240,7 +262,7 @@ async def create_public_or_staff_48h_hold(
             user_type=UserType.CLIENT_PRIMARY,
             email=clean_email,
             phone=clean_phone,
-            password_hash=hash_password("Client@2026"),
+            password_hash=hash_password(secrets.token_urlsafe(24)),
             full_name=body.client_full_name.strip(),
             preferred_lang="ar",
         )
@@ -258,9 +280,52 @@ async def create_public_or_staff_48h_hold(
     catering_total, merged_hall_addon = await _compute_addons(
         db, tenant.id, body.hall_id, body.guest_count, body.catering_item_id, body.merge_combinable_hall
     )
-    addons_total = sum(
-        (a.unit_price * Decimal(a.quantity) for a in body.addons), Decimal("0.00")
-    ).quantize(Decimal("0.01"))
+
+    # Enforce DB-authoritative pricing for addons and validate stock
+    addons_total = Decimal("0.00")
+    verified_addons: list[tuple[InventoryItem, int, Decimal]] = []
+    for a in body.addons:
+        inv_item = (
+            await db.execute(
+                select(InventoryItem).where(
+                    InventoryItem.id == a.item_id,
+                    InventoryItem.tenant_id == tenant.id,
+                    InventoryItem.lifecycle == RecordLifecycle.ACTIVE,
+                )
+            )
+        ).scalar_one_or_none()
+        if not inv_item:
+            raise HTTPException(status_code=404, detail=f"Addon inventory item {a.item_id} not found")
+        if a.quantity > inv_item.total_stock:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Requested quantity ({a.quantity}) exceeds total stock ({inv_item.total_stock}) for {inv_item.name}",
+            )
+        db_unit_price = Decimal(str(inv_item.unit_addon_price)).quantize(Decimal("0.01"))
+        addons_total += (db_unit_price * Decimal(a.quantity)).quantize(Decimal("0.01"))
+        verified_addons.append((inv_item, a.quantity, db_unit_price))
+
+    # Apply valid tenant storefront offer discount if offer_id provided
+    discount_amount = Decimal("0.00")
+    if body.offer_id:
+        offers = (tenant.settings or {}).get("storefront_offers") or []
+        matched_offer = next((o for o in offers if str(o.get("id")) == str(body.offer_id)), None)
+        if not matched_offer:
+            raise HTTPException(status_code=400, detail="Invalid promotional offer_id")
+        disc_pct = Decimal(str(matched_offer.get("discount_percent") or 0))
+        if disc_pct > Decimal("0.00"):
+            pre_disc = await AvailabilityService.calculate_dynamic_quote(
+                db,
+                tenant.id,
+                body.hall_id,
+                naive_start,
+                addon_amount=catering_total + merged_hall_addon + addons_total,
+                discount_amount=Decimal("0.00"),
+            )
+            discount_amount = (Decimal(str(pre_disc["subtotal"])) * (disc_pct / Decimal("100.00"))).quantize(
+                Decimal("0.01")
+            )
+
     pay_method = body.selected_payment_method.value if body.selected_payment_method else None
     immediate = body.payment_mode == "IMMEDIATE_DEPOSIT"
     transfer_ref = (body.transfer_reference or "").strip() or None
@@ -277,13 +342,17 @@ async def create_public_or_staff_48h_hold(
         tenant.id,
         body.hall_id,
         naive_start,
-        addon_amount=body.addon_amount + catering_total + merged_hall_addon + addons_total,
+        addon_amount=catering_total + merged_hall_addon + addons_total,
+        discount_amount=discount_amount,
     )
     quote["catering_total"] = float(catering_total)
     quote["merged_hall_addon"] = float(merged_hall_addon)
     quote["addons_total"] = float(addons_total)
+    quote["discount_amount"] = float(discount_amount)
 
-    event_code = f"EVT-{datetime.now(timezone.utc).year}-{str(uuid.uuid4().int % 10000).zfill(4)}"
+    seq_year = utcnow().year
+    event_code = await DoubleEntryService.next_sequence_number(db, tenant.id, "EVT", seq_year)
+    invoice_number = await DoubleEntryService.next_sequence_number(db, tenant.id, "INV", seq_year)
     hold_expires = utcnow() + timedelta(hours=48)
     event = Event(
         tenant_id=tenant.id,
@@ -299,11 +368,22 @@ async def create_public_or_staff_48h_hold(
     db.add(event)
     await db.flush()
 
+    for inv_item, qty_res, _ in verified_addons:
+        db.add(
+            EventInventoryAllocation(
+                tenant_id=tenant.id,
+                event_id=event.id,
+                item_id=inv_item.id,
+                quantity_reserved=qty_res,
+            )
+        )
+
     invoice = Invoice(
         tenant_id=tenant.id,
         event_id=event.id,
-        invoice_number=f"INV-{event_code}",
+        invoice_number=invoice_number,
         subtotal=Decimal(str(quote["subtotal"])),
+        discount_amount=discount_amount,
         tax_amount=Decimal(str(quote["tax_amount"])),
         total_amount=Decimal(str(quote["total_amount"])),
         security_deposit_amount=Decimal(str(quote["security_deposit_amount"])),
@@ -315,6 +395,7 @@ async def create_public_or_staff_48h_hold(
 
     deposit_due = (Decimal(str(quote["total_amount"])) * Decimal("0.50")).quantize(Decimal("0.01"))
     balance_due = Decimal(str(quote["total_amount"])) - deposit_due
+    final_due_date = max(hold_expires + timedelta(minutes=1), event.start_time - timedelta(days=7))
 
     milestones = [
         PaymentMilestone(
@@ -327,6 +408,8 @@ async def create_public_or_staff_48h_hold(
             amount_due=deposit_due,
             due_date=hold_expires,
             payment_method=pay_method,
+            is_security_deposit=False,
+            upload_token_jti=uuid.uuid4().hex,
             status="UNDER_REVIEW" if immediate else "PENDING",
         ),
         PaymentMilestone(
@@ -334,11 +417,28 @@ async def create_public_or_staff_48h_hold(
             invoice_id=invoice.id,
             title="الدفعة النهائية قبل المناسبة (50%) / Final Balance",
             amount_due=balance_due,
-            due_date=event.start_time - timedelta(days=7),
+            due_date=final_due_date,
             payment_method=pay_method,
+            is_security_deposit=False,
+            upload_token_jti=uuid.uuid4().hex,
             status="PENDING",
         ),
     ]
+    sec_dep_amt = Decimal(str(quote["security_deposit_amount"])).quantize(Decimal("0.01"))
+    if sec_dep_amt > Decimal("0.00"):
+        milestones.append(
+            PaymentMilestone(
+                tenant_id=tenant.id,
+                invoice_id=invoice.id,
+                title="تأمين الأضرار المسترد (أمانة 2100) / Refundable Security Deposit",
+                amount_due=sec_dep_amt,
+                due_date=final_due_date + timedelta(seconds=1),
+                payment_method=pay_method,
+                is_security_deposit=True,
+                upload_token_jti=uuid.uuid4().hex,
+                status="PENDING",
+            )
+        )
     db.add_all(milestones)
 
     contract = EventContract(
@@ -351,6 +451,23 @@ async def create_public_or_staff_48h_hold(
     db.add(contract)
     await db.flush()
 
+    # Post immediate Invoice Accrual in GL within the exact same ACID transaction
+    hall_and_addons_net = Decimal(str(quote["subtotal"])) - catering_total
+    if hall_and_addons_net < Decimal("0.00"):
+        catering_net = Decimal(str(quote["subtotal"]))
+        hall_and_addons_net = Decimal("0.00")
+    else:
+        catering_net = catering_total
+    await DoubleEntryService.post_invoice_accrual(
+        db=db,
+        tenant_id=tenant.id,
+        created_by_id=client_user.id,
+        invoice=invoice,
+        hall_and_addons_net=hall_and_addons_net,
+        catering_net=catering_net,
+        event_code=event_code,
+    )
+
     milestones_out = [
         {
             "id": str(m.id),
@@ -358,7 +475,11 @@ async def create_public_or_staff_48h_hold(
             "amount_due": float(m.amount_due),
             "due_date": m.due_date.isoformat(),
             "payment_method": m.payment_method,
+            "is_security_deposit": m.is_security_deposit,
             "status": m.status,
+            "upload_token": create_receipt_upload_token(tenant.id, m.id, m.upload_token_jti)
+            if m.upload_token_jti
+            else None,
         }
         for m in milestones
     ]
@@ -366,6 +487,7 @@ async def create_public_or_staff_48h_hold(
         "id": str(invoice.id),
         "invoice_number": invoice.invoice_number,
         "subtotal": float(invoice.subtotal),
+        "discount_amount": float(invoice.discount_amount),
         "tax_amount": float(invoice.tax_amount),
         "total_amount": float(invoice.total_amount),
         "security_deposit_amount": float(invoice.security_deposit_amount),
@@ -387,14 +509,16 @@ async def create_public_or_staff_48h_hold(
             action="HOLD_48H_CREATED",
             new_value={
                 "event_code": event_code,
+                "invoice_number": invoice_number,
                 "total_amount": quote["total_amount"],
                 "merged_halls": body.merge_combinable_hall,
                 "selected_payment_method": pay_method,
                 "payment_mode": body.payment_mode,
-                "catering_item_id": str(body.catering_item_id) if body.catering_item_id else None, "transfer_reference": transfer_ref,
+                "catering_item_id": str(body.catering_item_id) if body.catering_item_id else None,
+                "transfer_reference": transfer_ref,
                 "addons": [
-                    {"item_id": str(a.item_id), "quantity": a.quantity, "unit_price": float(a.unit_price)}
-                    for a in body.addons
+                    {"item_id": str(item.id), "quantity": qty, "unit_price": float(unit_p)}
+                    for item, qty, unit_p in verified_addons
                 ],
             },
         )
@@ -418,6 +542,7 @@ async def create_public_or_staff_48h_hold(
         "event_code": event.event_code,
         "client_id": str(client_user.id),
         "status": "HOLD_48H",
+        "portal_auth_hint": "OTP_LOGIN_REQUIRED",
         "expires_in_hours": 48,
         "hold_expires_at": hold_expires.isoformat(),
         "quote": quote,
@@ -681,25 +806,34 @@ async def upload_public_milestone_receipt(
     milestone_id: uuid.UUID,
     request: Request,
     receipt: UploadFile = File(...),
+    upload_token: Optional[str] = Form(default=None),
     payment_method: Optional[str] = Form(default=None),
     transfer_reference: Optional[str] = Form(default=None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Unauthenticated receipt upload for a milestone just created by POST /bookings/hold."""
+    """One-time signed-token receipt upload for a milestone created by POST /bookings/hold."""
     tenant = getattr(request.state, "tenant", None)
     if not tenant:
         raise HTTPException(status_code=400, detail="Tenant context required")
+    token = (upload_token or request.headers.get("x-upload-token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Signed upload_token is required")
+    jti = verify_receipt_upload_token(token, tenant.id, milestone_id)
+
     milestone = (
         await db.execute(
-            select(PaymentMilestone).where(
-                PaymentMilestone.id == milestone_id, PaymentMilestone.tenant_id == tenant.id
-            )
+            select(PaymentMilestone)
+            .where(PaymentMilestone.id == milestone_id, PaymentMilestone.tenant_id == tenant.id)
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if not milestone:
         raise HTTPException(status_code=404, detail="Milestone not found")
+    if not milestone.upload_token_jti or milestone.upload_token_jti != jti:
+        raise HTTPException(status_code=403, detail="Upload token already used or revoked")
     if milestone.status not in ("PENDING", "UNDER_REVIEW"):
         raise HTTPException(status_code=409, detail="Milestone no longer accepts receipts")
+    milestone.upload_token_jti = None
     client_id = (
         await db.execute(
             select(Event.primary_client_id)
@@ -751,7 +885,12 @@ async def list_staff_events(
 async def update_event_status(
     event_id: uuid.UUID,
     body: UpdateEventStatusBody,
-    auth: AuthContext = Depends(require_roles({UserType.INTERNAL_STAFF})),
+    auth: AuthContext = Depends(
+        require_roles(
+            {UserType.INTERNAL_STAFF},
+            {StaffRole.OWNER, StaffRole.SALES_MANAGER, StaffRole.OPS_MANAGER, StaffRole.FINANCE},
+        )
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     if not auth.tenant_id:
@@ -761,6 +900,17 @@ async def update_event_status(
     ).scalar_one_or_none()
     if not ev:
         raise HTTPException(status_code=404, detail="Event not found")
+    old_status = ev.status.value
     ev.status = body.status
+    db.add(
+        AuditLog(
+            tenant_id=auth.tenant_id,
+            event_id=ev.id,
+            actor_id=auth.user.id,
+            action="EVENT_STATUS_UPDATED",
+            old_value={"status": old_status},
+            new_value={"status": body.status.value},
+        )
+    )
     await db.commit()
     return {"status": ev.status.value}
