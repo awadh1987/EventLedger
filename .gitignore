@@ -20,3 +20,5 @@ dist/
 # OS / IDE
 .DS_Store
 Thumbs.db
+.env.production
+media/

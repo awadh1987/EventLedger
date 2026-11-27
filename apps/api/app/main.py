@@ -30,6 +30,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origin_regex=r"^https://([a-z0-9-]+\.)?events-ye\.services$",
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
@@ -61,3 +62,6 @@ async def health_check():
     except Exception:
         db_status = "unavailable"
     return {"status": "ok", "service": "EventLedger Python FastAPI", "database": db_status}
+
+from app.routers import media as media_router
+app.include_router(media_router.router, prefix="/api/v1")
